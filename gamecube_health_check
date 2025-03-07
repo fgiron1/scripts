@@ -1,0 +1,76 @@
+import pywinusb.hid as hid
+import time
+
+# List all HID devices
+devices = hid.HidDeviceFilter().get_devices()
+if not devices:
+    print("No HID devices detected. Please connect your controller.")
+    exit()
+
+print("Available HID devices:")
+for i, device in enumerate(devices):
+    print(f"{i}: {device.product_name} (Vendor ID: {device.vendor_id}, Product ID: {device.product_id})")
+
+# Select the correct device (index 8)
+device_index = 8  # Change this if needed
+if device_index < 0 or device_index >= len(devices):
+    print("Invalid device index.")
+    exit()
+
+device = devices[device_index]
+print(f"\nSelected device: {device.product_name}")
+
+# Function to decode raw data
+def decode_raw_data(data):
+    """
+    Decode raw data from the GameCube controller adapter.
+    """
+    if len(data) < 10:
+        return None
+
+    return {
+        "buttons": {
+            "A": bool(data[1] & 0b00000010),  # Bit 1
+            "B": bool(data[1] & 0b00000100),  # Bit 2
+            "X": bool(data[1] & 0b00000001),  # Bit 0
+            "Y": bool(data[1] & 0b00001000),  # Bit 3
+            "Z": bool(data[1] & 0b10000000),  # Bit 7
+            "L": bool(data[1] & 0b00010000),  # Bit 4 (Left Trigger)
+            "R": bool(data[1] & 0b00100000),  # Bit 5 (Right Trigger)
+        },
+        "axes": {
+            "left_stick_x": data[3],  # Byte 3: Left stick X-axis
+            "left_stick_y": data[4],  # Byte 4: Left stick Y-axis
+            "right_stick_x": data[5],  # Byte 5: Right stick X-axis
+            "right_stick_y": data[6],  # Byte 6: Right stick Y-axis
+            "L_trigger": data[7],     # Byte 7: Left trigger
+            "R_trigger": data[8],     # Byte 8: Right trigger
+        },
+    }
+
+# Function to monitor the device
+def monitor_device(device):
+    print(f"\nMonitoring {device.product_name}...")
+    print("Press any button or move any axis on the controller to see input changes.")
+
+    last_state = None
+
+    def raw_data_handler(data):
+        nonlocal last_state
+        decoded = decode_raw_data(data)
+        if decoded and decoded != last_state:
+            print(f"Input change detected: {decoded}")
+            last_state = decoded
+
+    try:
+        device.open()
+        device.set_raw_data_handler(raw_data_handler)
+        while True:
+            time.sleep(0.1)  # Reduce CPU usage
+    except Exception as e:
+        print(f"Error: {e}")
+    finally:
+        device.close()
+
+# Start monitoring the selected device
+monitor_device(device)

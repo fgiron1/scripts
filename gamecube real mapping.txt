@@ -1,0 +1,20 @@
+GAMECUBE REAL MAPPINGS:
+A ---- BUTTON 2
+B ---- BUTTON 3
+Y ---- BUTTON 4
+X ---- BUTTON 1
+Z ---- BUTTON 8
+START
+L BUTTON ---- BUTTON 5
+R BUTTON ---- BUTTON 6
+
+C - STICK
+	Axes, Z
+	Axes, RotationZ
+
+Joystick
+
+	Axes, X
+	Axes, Y
+
+D-Pad doesn't exist
