@@ -1,11 +1,14 @@
 [package]
 name = "ps4_midi_mapper"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
-gilrs = "0.9"          # Gamepad input library (cross-platform)
-midir = "0.8"          # MIDI library (cross-platform)
-ctrlc = "3.2"          # For handling Ctrl+C gracefully
-evdev = "0.13.0"
-nix = { version = "0.29.0", features = ["poll"] }
+rusty-xinput = "1.3.0"
+hidapi = "2.0.0"
+windows = { version = "0.54.0", features = ["Win32_UI_Input"] }
+
+# Para soporte de Linux
+[target.'cfg(target_os = "linux")'.dependencies]
+gilrs = { version = "0.9", features = ["serde"] }
+evdev = "0.12"
