@@ -10,7 +10,7 @@ pub mod midi_output;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use controller::{Controller, ControllerType, types::{Button, Axis, ControllerEvent}};
 use driver_setup::DriverSetup;
-use midir::MidiOutput;  // Instead of use midi_output::MidiOutput;
+use midi_output::MidiSender;
 
 // Configuration
 const MIDI_PORT_NAME: &str = "PS4 Port";
@@ -46,17 +46,17 @@ const AXIS_MAPPINGS: [(Axis, u8); 6] = [
 ];
 
 struct MidiMapper {
-    midi_out: MidiOutput,
+    midi_sender: MidiSender,
     controller: Box<dyn Controller>,
     active_controls: Vec<(String, String, String)>,
 }
 
 impl MidiMapper {
     fn new() -> Result<Self, Box<dyn Error>> {
-        let midi_out = MidiOutput::new(MIDI_PORT_NAME)?;
+        let midi_sender = MidiSender::new(MIDI_PORT_NAME)?;
 
         // Create controller and get its type
-        let (controller, ctype) = controller::create_controller()?;
+        let (controller, ctype) = controller::create_controller(None)?;
 
         // Print controller type
         match ctype {
@@ -66,7 +66,7 @@ impl MidiMapper {
         }
 
         Ok(Self {
-            midi_out,
+            midi_sender,
             controller,
             active_controls: Vec::new(),
         })
@@ -81,12 +81,17 @@ impl MidiMapper {
         if let Some(&(_, cc)) = AXIS_MAPPINGS.iter().find(|&&(a, _)| a == axis) {
             let midi_value = if matches!(axis, Axis::LeftStickX | Axis::LeftStickY | 
                 Axis::RightStickX | Axis::RightStickY) && value.abs() < JOYSTICK_DEADZONE {
+                // Skip sending MIDI messages if the joystick is in the deadzone
                 return Ok(());
             } else {
+                // Map the axis value to a MIDI range (0-127)
                 Self::map_value(value, 0, 127)
             };
-
-            self.connection.send(&[0xB0 | MIDI_CHANNEL, cc, midi_value])?;
+    
+            // Send the MIDI control change message
+            self.midi_sender.send_control_change(MIDI_CHANNEL, cc, midi_value)?;
+    
+            // Update the display with the current control state
             self.update_display(
                 format!("{:?}", axis),
                 format!("{:.4}", value),
@@ -99,7 +104,11 @@ impl MidiMapper {
     fn process_button(&mut self, button: Button, pressed: bool) -> Result<(), Box<dyn Error>> {
         if let Some(&(_, note)) = BUTTON_MAPPINGS.iter().find(|&&(b, _)| b == button) {
             let velocity = if pressed { 127 } else { 0 };
-            self.connection.send(&[0x90 | MIDI_CHANNEL, note, velocity])?;
+    
+            // Send the MIDI note on/off message
+            self.midi_sender.send_note_on(MIDI_CHANNEL, note, velocity)?;
+    
+            // Update the display with the current button state
             self.update_display(
                 format!("{:?}", button),
                 pressed.to_string(),
@@ -147,9 +156,9 @@ impl MidiMapper {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let hinstance = unsafe { GetModuleHandleW(None)? };
-    let setup = DriverSetup::new(hinstance)?;
+    let setup = DriverSetup::new(hinstance, None)?;
     // Check drivers
-    let setup = DriverSetup::new();
+
     // Create mapper
     let mut mapper = MidiMapper::new()?;
     mapper.run()

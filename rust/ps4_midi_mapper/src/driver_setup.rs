@@ -1,6 +1,6 @@
 use windows::core::{Result, ComInterface, GUID};
-use windows::Win32::Foundation::HINSTANCE; 
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Devices::HumanInterfaceDevice::{
     IDirectInput8A, DirectInput8Create, IDirectInputDevice8A, DIDEVICEINSTANCEA
 };
@@ -18,7 +18,7 @@ pub struct DriverSetup {
 }
 
 impl DriverSetup {
-    pub fn new(hinstance: HINSTANCE, user_candidate_guids: Option<Vec<GUID>>) -> Result<Self> {
+    pub fn new(hinstance: HMODULE, user_candidate_guids: Option<Vec<GUID>>) -> Result<Self> {
         let mut direct_input = None;
         unsafe {
             DirectInput8Create(
