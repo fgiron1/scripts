@@ -1,74 +1,118 @@
-// src/controller/directinput.rs
-use super::types::{Button, Axis, ControllerEvent};
+use windows::Win32::Devices::HumanInterfaceDevice::{IDirectInputDevice8A, DIJOYSTATE};
 use super::Controller;
-use hidapi::HidApi;
+use windows::core::Result;
+use crate::controller::types::{ControllerEvent, Button, InputEvent, Input, Axis, Joystick};
+use std::ffi::c_void;
 use std::error::Error;
 
 pub struct DirectInputController {
-    device: hidapi::HidDevice,
+    device: IDirectInputDevice8A,
 }
 
 impl DirectInputController {
-    pub fn new() -> Result<Self, Box<dyn Error>> {
-        let api = HidApi::new()?;
-        let device = api.open(0x054C, 0x09CC)?; // Sony DS4 Vendor/Product IDs
-
+    pub fn new(device: IDirectInputDevice8A) -> Result<Self> {
         Ok(Self { device })
+    }
+
+    fn poll(&self) -> Result<Vec<InputEvent>> {
+        let mut state = DIJOYSTATE::default();
+        unsafe {
+            self.device.GetDeviceState(
+                std::mem::size_of::<DIJOYSTATE>() as u32,
+                &mut state as *mut _ as *mut c_void
+            )?;
+        }
+        Ok(process_directinput_state(&state))
     }
 }
 
 impl Controller for DirectInputController {
-    fn poll_events(&mut self) -> Result<Vec<ControllerEvent>, Box<dyn Error>> {
-        let mut events = Vec::new();
-        let mut buffer = [0u8; 64];
-    
-        if self.device.read(&mut buffer)? > 0 {
-            // Buttons (byte 5)
-            let buttons = buffer[5];
-            events.extend(
-                [
-                    (0x10, Button::Cross), (0x20, Button::Circle),
-                    (0x40, Button::Square), (0x80, Button::Triangle),
-                    (0x01, Button::L1), (0x02, Button::R1),
-                    (0x04, Button::Share), (0x08, Button::Options),
-                    (0x10, Button::L3), (0x20, Button::R3)
-                ].iter().filter_map(|(mask, btn)| {
-                    (buttons & mask != 0).then(|| ControllerEvent::ButtonPress {
-                        button: *btn,
-                        pressed: true
-                    })
-                })
-            );
-    
-            // Triggers (bytes 8-9)
-            events.push(ControllerEvent::AxisMove {
-                axis: Axis::L2,
-                value: buffer[8] as f32 / 255.0
-            });
-            events.push(ControllerEvent::AxisMove {
-                axis: Axis::R2,
-                value: buffer[9] as f32 / 255.0
-            });
-    
-            // Sticks (bytes 1-4)
-            events.push(ControllerEvent::AxisMove {
-                axis: Axis::LeftStickX,
-                value: (buffer[1] as i16 - 128) as f32 / 128.0
-            });
-            events.push(ControllerEvent::AxisMove {
-                axis: Axis::LeftStickY,
-                value: (buffer[2] as i16 - 128) as f32 / 128.0
-            });
-            events.push(ControllerEvent::AxisMove {
-                axis: Axis::RightStickX,
-                value: (buffer[3] as i16 - 128) as f32 / 128.0
-            });
-            events.push(ControllerEvent::AxisMove {
-                axis: Axis::RightStickY,
-                value: (buffer[4] as i16 - 128) as f32 / 128.0
-            });
-        }
-    
-        Ok(events)
+    fn poll_events(&mut self) -> std::result::Result<Vec<ControllerEvent>, Box<dyn Error>> {
+        let raw_events = self.poll()?;
+        Ok(raw_events.into_iter().map(|e| match e {
+            InputEvent::Axis(input, value) => ControllerEvent::AxisMove {
+                axis: match input {
+                    Input::LeftStickX => Axis::LeftStickX,
+                    Input::LeftStickY => Axis::LeftStickY,
+                    Input::RightStickX => Axis::RightStickX,
+                    Input::RightStickY => Axis::RightStickY,
+                    Input::LeftTrigger => Axis::L2,
+                    Input::RightTrigger => Axis::R2,
+                    _ => unreachable!(),
+                },
+                value,
+            },
+            InputEvent::Button(input, pressed) => ControllerEvent::ButtonPress {
+                button: match input {
+                    Input::Button(0) => Button::Cross,
+                    Input::Button(1) => Button::Circle,
+                    // Add other button mappings...
+                    _ => Button::Unknown,
+                },
+                pressed,
+            },
+        }).collect())
     }
+}
+
+
+fn process_directinput_state(state: &DIJOYSTATE) -> Vec<InputEvent> {
+    let mut events = Vec::new();
+
+    // Process trackpad
+    let trackpad_x = state.rglSlider[0] as i16;
+    let trackpad_y = state.rglSlider[1] as i16;
+
+    events.push(InputEvent::Axis(
+        Input::TrackpadX,
+        Joystick::with_deadzone(trackpad_x, super::win_xinput::JOYSTICK_DEADZONE),
+    ));
+
+    events.push(InputEvent::Axis(
+        Input::TrackpadY,
+        Joystick::with_deadzone(trackpad_y, super::win_xinput::JOYSTICK_DEADZONE),
+    ));
+
+    // Process triggers
+    let left_trigger = state.rgdwPOV[0] as u8;
+    let right_trigger = state.rgdwPOV[1] as u8;
+
+    let left_trigger = if left_trigger < super::win_xinput::TRIGGER_DEADZONE {
+        0
+    } else {
+        left_trigger
+    };
+    let right_trigger = if right_trigger < super::win_xinput::TRIGGER_DEADZONE {
+        0
+    } else {
+        right_trigger
+    };
+
+    events.push(InputEvent::Axis(
+        Input::LeftTrigger,
+        left_trigger as f32 / 255.0,
+    ));
+    events.push(InputEvent::Axis(
+        Input::RightTrigger,
+        right_trigger as f32 / 255.0,
+    ));
+
+    // Process joysticks
+    let lx = Joystick::with_deadzone(state.lX as i16, super::win_xinput::JOYSTICK_DEADZONE);
+    let ly = Joystick::with_deadzone(state.lY as i16, super::win_xinput::JOYSTICK_DEADZONE);
+    let rx = Joystick::with_deadzone(state.lZ as i16, super::win_xinput::JOYSTICK_DEADZONE);
+    let ry = Joystick::with_deadzone(state.lRz as i16, super::win_xinput::JOYSTICK_DEADZONE);
+
+    events.push(InputEvent::Axis(Input::LeftStickX, lx));
+    events.push(InputEvent::Axis(Input::LeftStickY, ly));
+    events.push(InputEvent::Axis(Input::RightStickX, rx));
+    events.push(InputEvent::Axis(Input::RightStickY, ry));
+
+    // Process buttons
+    for (i, &btn) in state.rgbButtons.iter().enumerate() {
+        let pressed = btn >= 0x80;  // Buttons are 0x00-0xFF where >= 0x80 is pressed
+        events.push(InputEvent::Button(Input::Button(i as u8), pressed));
+    }
+
+    events
 }

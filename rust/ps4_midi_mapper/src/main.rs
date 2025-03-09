@@ -3,13 +3,14 @@ use std::error::Error;
 use std::thread;
 use std::time::Duration;
 
-mod controller;
-mod driver_setup;
-mod midi_output;
+pub mod controller;
+pub mod driver_setup;
+pub mod midi_output;
 
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use controller::{Controller, ControllerType, types::{Button, Axis, ControllerEvent}};
 use driver_setup::DriverSetup;
-use midi_output::MidiOutput;
+use midir::MidiOutput;  // Instead of use midi_output::MidiOutput;
 
 // Configuration
 const MIDI_PORT_NAME: &str = "PS4 Port";
@@ -85,7 +86,7 @@ impl MidiMapper {
                 Self::map_value(value, 0, 127)
             };
 
-            self.midi_out.send(&[0xB0 | MIDI_CHANNEL, cc, midi_value])?;
+            self.connection.send(&[0xB0 | MIDI_CHANNEL, cc, midi_value])?;
             self.update_display(
                 format!("{:?}", axis),
                 format!("{:.4}", value),
@@ -98,7 +99,7 @@ impl MidiMapper {
     fn process_button(&mut self, button: Button, pressed: bool) -> Result<(), Box<dyn Error>> {
         if let Some(&(_, note)) = BUTTON_MAPPINGS.iter().find(|&&(b, _)| b == button) {
             let velocity = if pressed { 127 } else { 0 };
-            self.midi_out.send(&[0x90 | MIDI_CHANNEL, note, velocity])?;
+            self.connection.send(&[0x90 | MIDI_CHANNEL, note, velocity])?;
             self.update_display(
                 format!("{:?}", button),
                 pressed.to_string(),
@@ -145,10 +146,10 @@ impl MidiMapper {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    let hinstance = unsafe { GetModuleHandleW(None)? };
+    let setup = DriverSetup::new(hinstance)?;
     // Check drivers
     let setup = DriverSetup::new();
-    setup.check_requirements()?;
-
     // Create mapper
     let mut mapper = MidiMapper::new()?;
     mapper.run()

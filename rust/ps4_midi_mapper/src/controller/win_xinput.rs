@@ -1,8 +1,12 @@
-// src/controller/windows.rs
+
 use super::types::{Button, Axis, ControllerEvent};
 use super::Controller;
 use rusty_xinput::XInputHandle;
 use std::error::Error;
+
+pub const JOYSTICK_DEADZONE: i16 = 2500;  // ~8% of i16 range
+pub const TRIGGER_DEADZONE: u8 = 5;       // ~2% of u8 range
+pub const TRACKPAD_AXES: [usize; 2] = [4, 5];  // X=Slider[0], Y=Slider[1]
 
 pub struct XInputController {
     xinput: XInputHandle,
@@ -45,7 +49,7 @@ impl XInputController {
 }
 
 impl Controller for XInputController {
-    fn poll_events(&mut self) -> Result<Vec<ControllerEvent>, Box<dyn Error>> {
+    fn poll_events(&mut self) -> std::result::Result<Vec<ControllerEvent>, Box<dyn Error>>{
         let mut events = Vec::new();
 
         match self.xinput.get_state(self.controller_id) {

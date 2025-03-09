@@ -1,125 +1,145 @@
-use std::error::Error;
-use std::process::Command;
-use std::path::{Path, PathBuf};
+use windows::core::{Result, ComInterface, GUID};
+use windows::Win32::Foundation::HINSTANCE; 
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::Devices::HumanInterfaceDevice::{
+    IDirectInput8A, DirectInput8Create, IDirectInputDevice8A, DIDEVICEINSTANCEA
+};
+use std::ffi::c_void;
+use std::collections::HashMap;
+use crate::controller::{ControllerType, Controller, DirectInputController};
+use crate::controller::types::{DriverConfig, AxisConfig, Input};
+
 
 pub struct DriverSetup {
-    ds4windows_path: Option<PathBuf>,
-    ds4windows_running: bool,
-    vigembus_installed: bool,
+    pub direct_input: IDirectInput8A,
+    pub device_guids: HashMap<String, GUID>, // Almacena los GUIDs de los dispositivos
+    pub candidate_guids: Vec<GUID>,
+
 }
 
 impl DriverSetup {
-    pub fn new() -> Self {
-        #[cfg(target_os = "windows")]
-        {
-        Self {
-            ds4windows_path: Self::find_ds4windows(),
-            ds4windows_running: Self::is_ds4windows_running(),
-            vigembus_installed: Self::check_vigembus(),
-        }
+    pub fn new(hinstance: HINSTANCE, user_candidate_guids: Option<Vec<GUID>>) -> Result<Self> {
+        let mut direct_input = None;
+        unsafe {
+            DirectInput8Create(
+                hinstance,
+                0x0800,
+                &IDirectInput8A::IID as *const GUID,
+                &mut direct_input as *mut _ as *mut _,
+                None
+            )?;
         }
 
-        #[cfg(target_os = "linux")]
-        {
-            Self {
-                ds4windows_path: None,
-                ds4windows_running: false,
-                vigembus_installed: false,
-            }
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    fn find_ds4windows() -> Option<PathBuf> {
-        let user_profile = std::env::var("USERPROFILE").unwrap_or_default();
-        let paths = vec![
-            PathBuf::from(r"C:\Program Files\DS4Windows"),
-            PathBuf::from(r"C:\Program Files (x86)\DS4Windows"),
-            PathBuf::from(&user_profile).join(r"AppData\Local\DS4Windows"),
-            PathBuf::from(&user_profile).join(r"AppData\Roaming\DS4Windows"),
-            PathBuf::from(&user_profile).join("Downloads").join("DS4Windows"),
+        // Inicializa la lista de GUIDs candidatos con valores predeterminados
+        let mut candidate_guids = vec![
+            GUID { data1: 0x054C, data2: 0x09CC, data3: 0, data4: [0; 8] }, // GUID del controlador inalámbrico
+            // Puedes agregar más GUIDs candidatos aquí (clones de controladores oficiales)
         ];
 
-        paths.into_iter()
-            .find(|path| path.exists() && path.join("DS4Windows.exe").exists())
+        // Agrega los GUIDs proporcionados por el usuario si están presentes
+        if let Some(user_guids) = user_candidate_guids {
+            candidate_guids.extend(user_guids);
+        }
+
+        Ok(Self { 
+            direct_input: direct_input.unwrap(),
+            device_guids: HashMap::new(), // Inicializa el HashMap
+            candidate_guids, // Inicializa la lista de GUIDs candidatos
+        })
     }
 
-    #[cfg(target_os = "windows")]
-    fn is_ds4windows_running() -> bool {
-        let output = Command::new("tasklist")
-            .output()
-            .ok();
-            
-        if let Some(output) = output {
-            let processes = String::from_utf8_lossy(&output.stdout);
-            processes.contains("DS4Windows.exe")
-        } else {
-            false
-        }
+    pub fn configure_directinput(&self) -> Result<DriverConfig> {
+        let mut config = DriverConfig {
+            axes: HashMap::new(),
+        };
+        
+        config.axes.insert(Input::TrackpadX, AxisConfig { range: -1.0..1.0 });
+        config.axes.insert(Input::TrackpadY, AxisConfig { range: -1.0..1.0 });
+        
+        Ok(config)
     }
 
-    #[cfg(target_os = "windows")]
-    fn check_vigembus() -> bool {
-        let service_check = Command::new("sc")
-            .args(["query", "ViGEmBus"])
-            .output()
-            .map(|output| {
-                let status = output.status.success();
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                status && stdout.contains("RUNNING")
-            })
-            .unwrap_or(false);
-
-        let driver_path = Path::new(r"C:\Windows\System32\drivers\ViGEmBus.sys");
-        
-        service_check || driver_path.exists()
+    pub fn create_device(&self, guid: &GUID) -> Result<IDirectInputDevice8A> {
+        let mut device: Option<IDirectInputDevice8A> = None;
+        unsafe {
+            self.direct_input.CreateDevice(
+                guid,
+                &mut device as *mut _ as *mut _,
+                None
+            )?;
+        }
+        Ok(device.unwrap())
     }
 
-    pub fn check_requirements(&self) -> Result<(), Box<dyn Error>> {
-        #[cfg(target_os = "windows")]
-        {
-        println!("\n=== System Requirements Check ===");
-        
-        // Check DS4Windows installation
-        match &self.ds4windows_path {
-            Some(path) => println!("✓ DS4Windows found at: {}", path.display()),
-            None => println!("ℹ️ DS4Windows not found in common locations")
+    pub fn enumerate_devices(&mut self) -> Result<()> {
+        unsafe extern "system" fn enum_callback(
+            instance: *mut DIDEVICEINSTANCEA,
+            context: *mut c_void,
+        ) -> windows::Win32::Foundation::BOOL {
+            let instance = &*instance;
+            let setup = &mut *(context as *mut DriverSetup); // Accede a DriverSetup
+    
+            // Convierte todos los campos a su representación hexadecimal en una sola línea
+            let guid_string = format!(
+                "{:X}-{:X}-{:X}-{}",
+                instance.guidProduct.data1,
+                instance.guidProduct.data2,
+                instance.guidProduct.data3,
+                instance.guidProduct.data4.iter()
+                    .map(|byte| format!("{:02X}", byte)) // Convierte cada byte a hexadecimal
+                    .collect::<Vec<String>>() // Recoge los resultados en un vector
+                    .join("") // Une los elementos en una sola cadena
+            );
+    
+            // Almacena el GUID en el HashMap
+            setup.device_guids.insert(guid_string, instance.guidProduct);
+    
+            return windows::Win32::Foundation::BOOL(1); // Continúa enumerando, usando `BOOL(1)`
         }
-
-        // Check if DS4Windows is running
-        if self.ds4windows_running {
-            println!("✓ DS4Windows is currently running");
-        } else {
-            println!("⚠️ DS4Windows does not appear to be running");
-            println!("   Please make sure DS4Windows is running for best controller support");
+    
+        unsafe {
+            let context = self as *mut _ as *mut c_void; // Crea un puntero mutable antes de la llamada
+            self.direct_input.EnumDevices(
+                0, // Puedes usar DIEDFL_ALLDEVICES para enumerar todos los dispositivos
+                Some(enum_callback),
+                context, // Pasa `self` como contexto
+                0,
+            )?;
         }
-
-        // Check ViGEmBus
-        if self.vigembus_installed {
-            println!("✓ ViGEmBus driver installed");
-        } else {
-            println!("⚠️ ViGEmBus driver not detected (required for DS4Windows)");
-        }
-
-        // Show summary and continue regardless
-        println!("\nDriver Status: {}", 
-            if self.ds4windows_running && self.vigembus_installed {
-                "DS4Windows (optimal)"
-            } else if self.vigembus_installed {
-                "ViGEmBus only (DS4Windows recommended)"
-            } else {
-                "Basic XInput (limited functionality)"
-            }
-        );
-        
-        println!("\nContinuing with available driver...");
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            println!("✓ Linux native input detected");
-        }
-
         Ok(())
     }
+
+    pub fn filter_device_guids(&self) -> HashMap<String, GUID> {
+        let mut filtered_guids = HashMap::new();
+
+        for (guid_string, guid) in &self.device_guids {
+            if self.candidate_guids.iter().any(|candidate| *candidate == *guid) {
+                filtered_guids.insert(guid_string.clone(), *guid);
+            }
+        }
+
+        filtered_guids
+    }
 }
+
+#[cfg(target_os = "windows")]
+pub fn create_controller(user_candidate_guids: Option<Vec<GUID>>) -> Result<(Box<dyn Controller>, ControllerType)> {
+    let hinstance = unsafe { GetModuleHandleW(None)? }; // Directly use imported function
+    let mut setup = DriverSetup::new(hinstance, user_candidate_guids)?; // Pasa la lista de GUIDs candidatos
+
+    // Aquí enumeramos los dispositivos
+    setup.enumerate_devices()?; // Esto llenará device_guids con los dispositivos encontrados
+
+    // Filtra los device_guids según los candidate_guids
+    let filtered_guids = setup.filter_device_guids();
+
+    // Ahora, intenta crear un dispositivo usando el primer GUID encontrado
+    if let Some((_, guid)) = filtered_guids.iter().next() { // Obtén el primer GUID encontrado
+        let device = setup.create_device(guid)?; // Crea el dispositivo usando el GUID
+        let dinput = DirectInputController::new(device)?; // Crea el controlador
+        return Ok((Box::new(dinput), ControllerType::DirectInput));
+    }
+
+    Err(windows::core::Error::from_win32()) // Manejo de error si no se encuentra un dispositivo
+}
+
