@@ -19,8 +19,10 @@ hidapi = "2.0.0"
 midir = "0.10.1"
 log = "0.4.20"
 
-
-# Para soporte de Linux
+# Linux support
 [target.'cfg(target_os = "linux")'.dependencies]
 gilrs = { version = "0.9", features = ["serde"] }
 evdev = "0.12"
+
+[build-dependencies]
+winres = "0.1"
