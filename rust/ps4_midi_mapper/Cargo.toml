@@ -9,6 +9,7 @@ default-features = true
 features = [
     "Win32_Foundation",
     "Win32_System_SystemServices",
+    "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_Devices_HumanInterfaceDevice",
     "Win32_System_Com",
     "Win32_System_LibraryLoader"
@@ -26,3 +27,6 @@ evdev = "0.12"
 
 [build-dependencies]
 winres = "0.1"
+
+[dev-dependencies]
+serial_test = "0.6.0"  # Optional: For serial test execution

@@ -1,16 +1,17 @@
-// src/main.rs
 use std::error::Error;
 use std::thread;
 use std::time::Duration;
 
-pub mod controller;
-pub mod driver_setup;
-pub mod midi_output;
+mod device_registry;
+mod controllers;
+mod midi_output;
+mod platform;
 
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use controller::{Controller, ControllerType, types::{Button, Axis, ControllerEvent}};
-use driver_setup::DriverSetup;
-use midi_output::MidiSender;
+use crate::{
+    device_registry::{Controller, ControllerEvent, Axis, Button, DeviceRegistry},
+    midi_output::MidiSender,
+    controllers::register_controllers
+};
 
 // Configuration
 const MIDI_PORT_NAME: &str = "PS4 Port";
@@ -47,27 +48,24 @@ const AXIS_MAPPINGS: [(Axis, u8); 6] = [
 
 struct MidiMapper {
     midi_sender: MidiSender,
-    controller: Box<dyn Controller>,
+    controllers: Vec<Box<dyn Controller>>,
     active_controls: Vec<(String, String, String)>,
 }
 
 impl MidiMapper {
-    fn new() -> Result<Self, Box<dyn Error>> {
+    fn new(controllers: Vec<Box<dyn Controller>>) -> Result<Self, Box<dyn Error>> {
         let midi_sender = MidiSender::new(MIDI_PORT_NAME)?;
-
-        // Create controller and get its type
-        let (controller, ctype) = controller::create_controller(None)?;
-
-        // Print controller type
-        match ctype {
-            ControllerType::XInput => println!("Using XInput (DS4Windows)"),
-            ControllerType::DirectInput => println!("Using DirectInput (Native Bluetooth)"),
-            ControllerType::Linux => println!("Using Linux Native Input"),
+        
+        // Print controller types
+        for controller in &controllers {
+            let metadata = controller.get_metadata();
+            println!("Found controller: {} ({:04X}:{:04X})", 
+                metadata.product, metadata.vid, metadata.pid);
         }
 
         Ok(Self {
             midi_sender,
-            controller,
+            controllers,
             active_controls: Vec::new(),
         })
     }
@@ -81,17 +79,13 @@ impl MidiMapper {
         if let Some(&(_, cc)) = AXIS_MAPPINGS.iter().find(|&&(a, _)| a == axis) {
             let midi_value = if matches!(axis, Axis::LeftStickX | Axis::LeftStickY | 
                 Axis::RightStickX | Axis::RightStickY) && value.abs() < JOYSTICK_DEADZONE {
-                // Skip sending MIDI messages if the joystick is in the deadzone
                 return Ok(());
             } else {
-                // Map the axis value to a MIDI range (0-127)
                 Self::map_value(value, 0, 127)
             };
-    
-            // Send the MIDI control change message
+
             self.midi_sender.send_control_change(MIDI_CHANNEL, cc, midi_value)?;
-    
-            // Update the display with the current control state
+
             self.update_display(
                 format!("{:?}", axis),
                 format!("{:.4}", value),
@@ -104,11 +98,8 @@ impl MidiMapper {
     fn process_button(&mut self, button: Button, pressed: bool) -> Result<(), Box<dyn Error>> {
         if let Some(&(_, note)) = BUTTON_MAPPINGS.iter().find(|&&(b, _)| b == button) {
             let velocity = if pressed { 127 } else { 0 };
-    
-            // Send the MIDI note on/off message
             self.midi_sender.send_note_on(MIDI_CHANNEL, note, velocity)?;
-    
-            // Update the display with the current button state
+
             self.update_display(
                 format!("{:?}", button),
                 pressed.to_string(),
@@ -136,17 +127,23 @@ impl MidiMapper {
     fn run(&mut self) -> Result<(), Box<dyn Error>> {
         println!("Listening for inputs... (CTRL+C to exit)");
         loop {
-            let events = self.controller.poll_events()?;
-            for event in events {
-                match event {
-                    ControllerEvent::ButtonPress { button, pressed } => 
-                        self.process_button(button, pressed)?,
-                    ControllerEvent::AxisMove { axis, value } => 
-                        self.process_axis(axis, value)?,
-                    ControllerEvent::TouchpadEvent { x: _, y: _ } => {
-                        #[cfg(target_os = "linux")]
-                        self.process_touchpad(x, y)?;
+            for controller in self.controllers {
+                match controller.poll_events() {
+                    Ok(events) => {
+                        for event in events {
+                            match event {
+                                ControllerEvent::ButtonPress { button, pressed } => 
+                                    self.process_button(button, pressed)?,
+                                ControllerEvent::AxisMove { axis, value } => 
+                                    self.process_axis(axis, value)?,
+                                #[cfg(target_os = "linux")]
+                                ControllerEvent::TouchpadMove { x, y } => {
+                                    // Handle touchpad input if needed
+                                }
+                            }
+                        }
                     }
+                    Err(e) => eprintln!("Error polling controller: {}", e),
                 }
             }
             thread::sleep(Duration::from_millis(10));
@@ -154,12 +151,26 @@ impl MidiMapper {
     }
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
-    let hinstance = unsafe { GetModuleHandleW(None)? };
-    let setup = DriverSetup::new(hinstance, None)?;
-    // Check drivers
-
-    // Create mapper
-    let mut mapper = MidiMapper::new()?;
-    mapper.run()
+fn run(&mut self) -> Result<(), Box<dyn Error>> {
+    println!("Listening for inputs... (CTRL+C to exit)");
+    loop {
+        let mut any_events = false;
+        for controller in &mut self.controllers {
+            match controller.poll_events() {
+                Ok(events) => {
+                    for event in events {
+                        any_events = true;
+                        match event {
+                            // Handle events
+                        }
+                    }
+                }
+                Err(e) => eprintln!("Error: {}", e),
+            }
+        }
+        if any_events {
+            self.refresh_display();
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }

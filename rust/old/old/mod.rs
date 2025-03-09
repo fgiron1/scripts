@@ -4,6 +4,7 @@ use windows::core::GUID;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use crate::controller::types::ControllerEvent;
 
+
 #[cfg(target_os = "windows")]
 pub mod win_xinput;
 #[cfg(target_os = "windows")]
