@@ -2,6 +2,7 @@ use std::error::Error;
 use std::thread;
 use std::time::Duration;
 use std::collections::HashMap;
+use std::env;
 
 use crate::config::{MIDI_CHANNEL, JOYSTICK_DEADZONE, BUTTON_MAPPINGS, AXIS_MAPPINGS};
 use crate::controller::{Controller, types::{ControllerEvent, Button, Axis}};
@@ -13,6 +14,7 @@ pub struct MidiMapper {
     button_states: HashMap<Button, bool>,
     axis_values: HashMap<Axis, f32>,
     display_info: Vec<(String, String, String)>,
+    disable_display: bool,
 }
 
 impl MidiMapper {
@@ -28,12 +30,16 @@ impl MidiMapper {
         println!("\nConnected controller: {} ({:04X}:{:04X})", 
             device_info.product, device_info.vid, device_info.pid);
         
+        // Check if mapper display is disabled
+        let disable_display = env::var("PS4_DISABLE_MAPPER_DISPLAY").is_ok();
+        
         Ok(Self {
             midi_sender,
             controller,
             button_states: HashMap::new(),
             axis_values: HashMap::new(),
             display_info: Vec::new(),
+            disable_display,
         })
     }
     
@@ -58,12 +64,14 @@ impl MidiMapper {
                 let velocity = if pressed { 127 } else { 0 };
                 self.midi_sender.send_note(MIDI_CHANNEL, mapping.note, velocity)?;
                 
-                // Update display
-                self.update_display(
-                    format!("{:?}", button),
-                    format!("{}", if pressed { "Pressed" } else { "Released" }),
-                    format!("Note {} {}", mapping.note, if pressed { "on (127)" } else { "off (0)" }),
-                );
+                // Update display if enabled
+                if !self.disable_display {
+                    self.update_display(
+                        format!("{:?}", button),
+                        format!("{}", if pressed { "Pressed" } else { "Released" }),
+                        format!("Note {} {}", mapping.note, if pressed { "on (127)" } else { "off (0)" }),
+                    );
+                }
             }
         }
         
@@ -96,12 +104,14 @@ impl MidiMapper {
                 let midi_value = Self::map_value(processed_value);
                 self.midi_sender.send_control_change(MIDI_CHANNEL, mapping.cc, midi_value)?;
                 
-                // Update display
-                self.update_display(
-                    format!("{:?}", axis),
-                    format!("{:.2}", processed_value),
-                    format!("CC {} = {}", mapping.cc, midi_value),
-                );
+                // Update display if enabled
+                if !self.disable_display {
+                    self.update_display(
+                        format!("{:?}", axis),
+                        format!("{:.2}", processed_value),
+                        format!("CC {} = {}", mapping.cc, midi_value),
+                    );
+                }
             }
         }
         
@@ -129,6 +139,11 @@ impl MidiMapper {
     
     /// Update the display with current control information
     fn update_display(&mut self, control: String, value: String, midi: String) {
+        // Skip if display is disabled
+        if self.disable_display {
+            return;
+        }
+        
         // Find existing entry for this control or add a new one
         let pos = self.display_info.iter().position(|(c, _, _)| *c == control);
         
@@ -147,6 +162,11 @@ impl MidiMapper {
     
     /// Display current controller state in a table format
     fn refresh_display(&self) {
+        // Skip if display is disabled
+        if self.disable_display {
+            return;
+        }
+        
         // Clear screen (ANSI escape code)
         print!("\x1B[2J\x1B[H");
         
@@ -166,11 +186,13 @@ impl MidiMapper {
     /// Main processing loop
     pub fn run(&mut self) -> Result<(), Box<dyn Error>> {
         // Initial display setup
-        println!("\nWaiting for controller inputs...");
-        println!("Press Ctrl+C to exit.");
-        
-        // Initialize the display
-        self.refresh_display();
+        if !self.disable_display {
+            println!("\nWaiting for controller inputs...");
+            println!("Press Ctrl+C to exit.");
+            
+            // Initialize the display
+            self.refresh_display();
+        }
         
         loop {
             // Poll controller for events
