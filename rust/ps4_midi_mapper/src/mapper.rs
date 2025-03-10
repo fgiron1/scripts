@@ -9,7 +9,7 @@ use crate::midi::MidiSender;
 
 pub struct MidiMapper {
     midi_sender: MidiSender,
-    controller: Box<dyn Controller>,
+    pub controller: Box<dyn Controller>,
     button_states: HashMap<Button, bool>,
     axis_values: HashMap<Axis, f32>,
     display_info: Vec<(String, String, String)>,
@@ -62,7 +62,7 @@ impl MidiMapper {
                 self.update_display(
                     format!("{:?}", button),
                     format!("{}", if pressed { "Pressed" } else { "Released" }),
-                    format!("Note {} {}", mapping.note, if pressed { "on" } else { "off" }),
+                    format!("Note {} {}", mapping.note, if pressed { "on (127)" } else { "off (0)" }),
                 );
             }
         }
@@ -138,23 +138,23 @@ impl MidiMapper {
             self.display_info.push((control, value, midi));
         }
         
-        // Sort by control name
+        // Sort by control name for consistent display
         self.display_info.sort_by(|a, b| a.0.cmp(&b.0));
         
         // Refresh the display
         self.refresh_display();
     }
     
-    /// Display current controller state
+    /// Display current controller state in a table format
     fn refresh_display(&self) {
-        // Clear screen
+        // Clear screen (ANSI escape code)
         print!("\x1B[2J\x1B[H");
         
         println!("PS4/Controller MIDI Mapper");
         println!("==========================");
         println!();
         
-        // Display active controls
+        // Display active controls in a table format
         println!("{:<15} | {:<10} | {}", "Control", "Value", "MIDI");
         println!("{}", "-".repeat(45));
         
@@ -165,6 +165,13 @@ impl MidiMapper {
     
     /// Main processing loop
     pub fn run(&mut self) -> Result<(), Box<dyn Error>> {
+        // Initial display setup
+        println!("\nWaiting for controller inputs...");
+        println!("Press Ctrl+C to exit.");
+        
+        // Initialize the display
+        self.refresh_display();
+        
         loop {
             // Poll controller for events
             match self.controller.poll_events() {

@@ -98,5 +98,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     
     // Run the mapper
     println!("\nMIDI mapping started. Press Ctrl+C to exit.");
+    
+    // Display controller information
+    let device_info = mapper.controller.get_device_info();
+    println!("\nConnected controller: {} ({:04X}:{:04X})", 
+        device_info.product, device_info.vid, device_info.pid);
+    println!("Manufacturer: {}", device_info.manufacturer);
+    println!("\nControls are now being mapped to MIDI. Any controller input will be sent to your MIDI device.");
+    
     mapper.run()
 }
