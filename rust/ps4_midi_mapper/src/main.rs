@@ -8,7 +8,7 @@ mod midi_output;
 mod platform;
 
 use crate::{
-    device_registry::{Controller, ControllerEvent, Axis, Button, DeviceRegistry},
+    device_registry::{Controller, ControllerEvent, Axis, Button},
     midi_output::MidiSender,
     controllers::register_controllers
 };
@@ -76,16 +76,16 @@ impl MidiMapper {
     }
 
     fn process_axis(&mut self, axis: Axis, value: f32) -> Result<(), Box<dyn Error>> {
-        if let Some(&(_, cc)) = AXIS_MAPPINGS.iter().find(|&&(a, _)| a == axis) {
+        if let Some(&(_, cc)) = AXIS_MAPPINGS.iter().find(|&&(ref a, _)| *a == axis) {
             let midi_value = if matches!(axis, Axis::LeftStickX | Axis::LeftStickY | 
                 Axis::RightStickX | Axis::RightStickY) && value.abs() < JOYSTICK_DEADZONE {
                 return Ok(());
             } else {
                 Self::map_value(value, 0, 127)
             };
-
+    
             self.midi_sender.send_control_change(MIDI_CHANNEL, cc, midi_value)?;
-
+    
             self.update_display(
                 format!("{:?}", axis),
                 format!("{:.4}", value),
@@ -124,53 +124,51 @@ impl MidiMapper {
         }
     }
 
+    fn handle_event(&mut self, event: ControllerEvent) -> Result<(), Box<dyn Error>> {
+        match event {
+            ControllerEvent::ButtonPress { button, pressed } => 
+                self.process_button(button, pressed)?,
+            ControllerEvent::AxisMove { axis, value } => {
+                self.process_axis(axis, value)?;
+            },
+            #[cfg(target_os = "linux")]
+            ControllerEvent::TouchpadMove { x, y } => {
+                // Handle touchpad input if needed
+            }
+        }
+        Ok(())
+    }
+
     fn run(&mut self) -> Result<(), Box<dyn Error>> {
         println!("Listening for inputs... (CTRL+C to exit)");
         loop {
-            for controller in self.controllers {
-                match controller.poll_events() {
+            // Use an index-based loop to avoid holding the iterator borrow
+            for i in 0..self.controllers.len() {
+                // Get events in an inner scope to limit borrow duration
+                let events = {
+                    let controller = &mut self.controllers[i];
+                    controller.poll_events()
+                };
+    
+                match events {
                     Ok(events) => {
+                        // Process events after controller borrow is released
                         for event in events {
-                            match event {
-                                ControllerEvent::ButtonPress { button, pressed } => 
-                                    self.process_button(button, pressed)?,
-                                ControllerEvent::AxisMove { axis, value } => 
-                                    self.process_axis(axis, value)?,
-                                #[cfg(target_os = "linux")]
-                                ControllerEvent::TouchpadMove { x, y } => {
-                                    // Handle touchpad input if needed
-                                }
+                            if let Err(e) = self.handle_event(event) {
+                                eprintln!("Error handling event: {}", e);
                             }
                         }
                     }
-                    Err(e) => eprintln!("Error polling controller: {}", e),
+                    Err(e) => eprintln!("Error polling controller for events: {}", e),
                 }
             }
+            
             thread::sleep(Duration::from_millis(10));
         }
     }
 }
 
-fn run(&mut self) -> Result<(), Box<dyn Error>> {
-    println!("Listening for inputs... (CTRL+C to exit)");
-    loop {
-        let mut any_events = false;
-        for controller in &mut self.controllers {
-            match controller.poll_events() {
-                Ok(events) => {
-                    for event in events {
-                        any_events = true;
-                        match event {
-                            // Handle events
-                        }
-                    }
-                }
-                Err(e) => eprintln!("Error: {}", e),
-            }
-        }
-        if any_events {
-            self.refresh_display();
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
+fn main() -> Result<(), Box<dyn Error>> {
+    // Initialize platform-specific controllers
+    Ok(())
 }

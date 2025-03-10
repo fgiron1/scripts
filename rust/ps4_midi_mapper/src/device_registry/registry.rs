@@ -1,4 +1,4 @@
-use super::{Controller, DeviceMetadata};
+use super::Controller;
 use hidapi::{HidApi, HidDevice, HidError};
 use std::any::Any;
 

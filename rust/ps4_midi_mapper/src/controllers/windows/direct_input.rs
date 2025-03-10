@@ -1,19 +1,23 @@
 use windows::{
-    core::{Result, Error},
+    core::{HRESULT, Result, Error},
     Win32::{
         Devices::{
             HumanInterfaceDevice::{
                 IDirectInput8A, IDirectInputDevice8A, 
                 GUID_Joystick, c_dfDIJoystick,
-                DISCL_BACKGROUND, DISCL_NONEXCLUSIVE
+                DISCL_BACKGROUND, DISCL_NONEXCLUSIVE, CLSID_DirectInput8, IID_IDirectInput8A, DIJOYSTATE, DIDEVICEINSTANCEA
             },
             DeviceAndDriverInstallation::GUID
         },
-        Foundation::HANDLE,
+        Foundation::{HANDLE, HWND}
+        System::Com::{CoCreateInstance, CLSCTX_ALL}
     },
 };
+use std::{
+    ffi::c_void, mem::size_of, ptr::null_mut
+}, result::Result as StdResult;
 use crate::device_registry::{Controller, ControllerEvent, Axis, Button, DeviceMetadata};
-use std::{ffi::c_void, mem::size_of, ptr::null_mut};
+
 
 const JOYSTICK_DEADZONE: i16 = 7840;  // ~25% of i16 range
 const TRIGGER_DEADZONE: u8 = 30;      // ~12% of u8 range
@@ -29,9 +33,10 @@ impl super::InputDevice for DirectInputDeviceSpec {
         guid.data3 == 0x11CF
     }
 
-    fn connect(&self, handle: HANDLE) -> Result<Box<dyn Controller>, Box<dyn std::error::Error>> {
+    fn connect(&self, device: HidDevice) -> std::result::Result<Box<dyn Controller>, Box<dyn std::error::Error>> {
+        let handle = device.raw_handle(); // Implement this method in HidDevice
         let di_device = unsafe { create_di_device(handle)? };
-        Ok(Box::new(DirectInputController::new(di_device)?)) // Added closing )
+        Ok(Box::new(DirectInputController::new(di_device)?))
     }
 
     fn device_name(&self) -> &'static str {
@@ -72,8 +77,9 @@ impl DirectInputController {
 }
 
 impl Controller for DirectInputController {
-    fn poll_events(&mut self) -> Result<Vec<ControllerEvent>, Box<dyn std::error::Error>> {
-        let state = self.poll_state()?;
+    fn poll_events(&mut self) -> std::result::Result<Vec<ControllerEvent>, Box<dyn std::error::Error>> {
+        let state = self.poll_state()
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
         Ok(process_di_state(&state))
     }
 
@@ -176,8 +182,8 @@ unsafe fn get_device_metadata(device: &IDirectInputDevice8A) -> Result<DeviceMet
     device.GetDeviceInfo(&mut di_info)?;
 
     Ok(DeviceMetadata {
-        vid: (di_info.guidProduct.Data1 >> 16) as u16,
-        pid: (di_info.guidProduct.Data1 & 0xFFFF) as u16,
+        vid: (di_info.guidProduct.data1 >> 16) as u16,
+        pid: (di_info.guidProduct.data1 & 0xFFFF) as u16,
         version: di_info.dwDevType as u16,
         manufacturer: String::from_utf8_lossy(
             &di_info.tszInstanceName[..di_info.tszInstanceName.iter()
@@ -192,12 +198,34 @@ unsafe fn get_device_metadata(device: &IDirectInputDevice8A) -> Result<DeviceMet
 }
 
 /// Helper to create DirectInput device from handle
-unsafe fn create_di_device(handle: HANDLE) -> Result<IDirectInputDevice8A> {
-    let di = IDirectInput8A::new()?;
+unsafe fn create_di_device(handle: HANDLE) -> Result<IDirectInputDevice8A, Error> {
+    // Create DirectInput interface
+    let di: IDirectInput8A = CoCreateInstance(
+        &CLSID_DirectInput8,
+        None,
+        CLSCTX_ALL
+    )?;
+
+    // Create device
     let mut device = None;
-    di.CreateDevice(&GUID_Joystick, &mut device)?;
+    di.CreateDevice(&GUID_Joystick, &mut device, None)?;
+    
+    // Unwrap the device from Option
+    let device = device.ok_or(Error::new(
+        HSTRING::from("Failed to create device"), 
+        HRESULT(0x80004005)
+    ))?;
+
+    // Convert HANDLE to HWND
+    let hwnd = HWND(handle.0);
+
+    // Configure device
     device.SetDataFormat(&c_dfDIJoystick)?;
-    device.SetCooperativeLevel(handle, DISCL_BACKGROUND | DISCL_NONEXCLUSIVE)?;
+    device.SetCooperativeLevel(
+        hwnd, 
+        DISCL_BACKGROUND | DISCL_NONEXCLUSIVE
+    )?;
     device.Acquire()?;
+
     Ok(device)
 }

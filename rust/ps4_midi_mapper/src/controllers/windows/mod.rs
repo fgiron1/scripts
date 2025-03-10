@@ -1,28 +1,50 @@
-//! Windows-specific controller implementations
+use crate::device_registry::{Controller, DeviceMetadata, InputDevice};
+use hidapi::{HidDevice, HidError};
+use std::any::Any;
+use std::error::Error;
 
-mod hid;
-mod xinput;
-mod direct_input;
+pub struct DirectInputDeviceSpec;
+pub struct XInputDeviceSpec;
 
-pub use self::{
-    hid::HidDeviceSpec,
-    xinput::XInputDeviceSpec,
-    direct_input::DirectInputDeviceSpec
-};
+impl InputDevice for DirectInputDeviceSpec {
+    fn is_compatible(&self, device: &hidapi::DeviceInfo) -> bool {
+        // DirectInput compatibility check
+        device.product_string().map_or(false, |s| 
+            s.contains("Joystick") || s.contains("Gamepad"))
+    }
 
-use crate::device_registry::InputDevice;
+    fn connect(&self, device: HidDevice) -> Result<Box<dyn Controller>, HidError> {
+        // Convert HidDevice to HANDLE if needed
+        let handle = /* conversion logic */;
+        let controller = direct_input::DirectInputController::new(handle)?;
+        Ok(Box::new(controller))
+    }
 
-/// Common Windows controller features
-#[cfg(target_os = "windows")]
-pub trait WindowsControllerExt {
-    /// Check if controller requires elevated privileges
-    fn requires_elevation(&self) -> bool;
+    fn device_name(&self) -> &'static str {
+        "DirectInput-Compatible Controller"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
-#[cfg(target_os = "windows")]
-impl<T: InputDevice> WindowsControllerExt for T {
-    default fn requires_elevation(&self) -> bool {
-        // HID devices typically need admin rights for raw input
-        matches!(self.device_name(), "HID-compliant game controller")
+impl InputDevice for XInputDeviceSpec {
+    fn is_compatible(&self, device: &hidapi::DeviceInfo) -> bool {
+        // XInput compatibility check
+        device.vendor_id() == 0x045E && device.product_id() == 0x028E
+    }
+
+    fn connect(&self, _device: HidDevice) -> Result<Box<dyn Controller>, HidError> {
+        let controller = xinput::XInputController::try_create()?;
+        Ok(Box::new(controller))
+    }
+
+    fn device_name(&self) -> &'static str {
+        "XInput-Compatible Controller"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }

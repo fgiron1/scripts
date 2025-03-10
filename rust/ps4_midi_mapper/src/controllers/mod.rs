@@ -5,8 +5,14 @@ pub mod windows;
 #[cfg(target_os = "linux")]
 pub mod linux;
 
+#[cfg(target_os = "windows")]
+use windows::Win32::Foundation::HANDLE;
 use crate::device_registry::{Controller, DeviceMetadata};
 use std::error::Error;
+
+// Add HANDLE import for Windows
+#[cfg(target_os = "windows")]
+use windows::Win32::Foundation::HANDLE;
 
 /// Trait for platform-specific controller extensions
 pub trait PlatformControllerExt {
@@ -15,19 +21,6 @@ pub trait PlatformControllerExt {
 
     /// Get the battery level (if supported)
     fn battery_level(&self) -> Option<f32>;
-}
-
-/// Default implementation for platform extensions
-impl<T: Controller> PlatformControllerExt for T {
-    default fn is_connected(&self) -> bool {
-        // Assume connected unless platform-specific logic says otherwise
-        true
-    }
-
-    default fn battery_level(&self) -> Option<f32> {
-        // Default to no battery info
-        None
-    }
 }
 
 /// Common controller functionality
@@ -59,9 +52,11 @@ pub enum DeviceHandle {
 pub fn register_controllers(registry: &mut crate::device_registry::DeviceRegistry) {
     #[cfg(target_os = "windows")]
     {
-        registry.register_device(windows::HidDeviceSpec);
-        registry.register_device(windows::XInputDeviceSpec);
-        registry.register_device(windows::DirectInputDeviceSpec);
+        use crate::controllers::windows::{DirectInputDeviceSpec, XInputDeviceSpec};
+        
+        // Register the devices directly
+        registry.register_device(DirectInputDeviceSpec);
+        registry.register_device(XInputDeviceSpec);
     }
 
     #[cfg(target_os = "linux")]

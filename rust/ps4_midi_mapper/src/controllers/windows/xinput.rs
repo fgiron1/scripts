@@ -2,22 +2,23 @@ use rusty_xinput::{XInputHandle, XInputError};
 use crate::device_registry::{Controller, ControllerEvent, Axis, Button, DeviceMetadata};
 use std::error::Error;
 
-const JOYSTICK_DEADZONE: i16 = 2500;  // ~8% of i16 range
-const TRIGGER_DEADZONE: u8 = 5;       // ~2% of u8 range
+const JOYSTICK_DEADZONE: i16 = 2500;
+const TRIGGER_DEADZONE: u8 = 5;
 
 /// XInput device specification for the registry
 pub struct XInputDeviceSpec;
 
 impl super::InputDevice for XInputDeviceSpec {
-    fn is_compatible(&self, _device: &hidapi::DeviceInfo) -> bool {
-        // XInput devices aren't enumerated through HID
-        false
+    fn is_compatible(&self, device: &DeviceMetadata) -> bool {
+        device.vid == 0x045E && device.pid == 0x028E
     }
 
-    fn connect(&self, _device: hidapi::HidDevice) -> Result<Box<dyn Controller>, Box<dyn Error>> {
+    fn connect(&self, _device: HidDevice) -> Result<Box<dyn Controller>, HidError> {
         XInputController::try_create()
             .map(|c| Box::new(c) as Box<dyn Controller>)
-            .map_err(|e| Box::new(e) as Box<dyn Error>)
+            .map_err(|e| HidError::OpenHidDeviceError {
+                message: format!("XInput error: {}", e),
+            })
     }
 
     fn device_name(&self) -> &'static str {
@@ -37,10 +38,9 @@ pub struct XInputController {
 }
 
 impl XInputController {
-    /// Attempt to create an XInput controller on any available port
-    pub fn try_create() -> Result<Self, XInputError> {
+     /// Attempt to create an XInput controller on any available port
+     pub fn try_create() -> Result<Self, XInputError> {
         let handle = XInputHandle::load_default()?;
-
         for port in 0..4 {
             if handle.get_state(port).is_ok() {
                 return Ok(Self {
@@ -50,7 +50,6 @@ impl XInputController {
                 });
             }
         }
-
         Err(XInputError::NoController)
     }
 
@@ -166,8 +165,8 @@ impl Controller for XInputController {
 
     fn get_metadata(&self) -> DeviceMetadata {
         DeviceMetadata {
-            vid: 0x045E, // Microsoft
-            pid: 0x028E, // XInput-compatible
+            vid: 0x045E,
+            pid: 0x028E,
             version: 0,
             manufacturer: "Microsoft".into(),
             product: "XInput Controller".into(),

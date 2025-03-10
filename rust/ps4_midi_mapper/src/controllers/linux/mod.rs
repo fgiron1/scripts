@@ -4,7 +4,9 @@ mod dualshock;
 
 pub use self::dualshock::DualShockDeviceSpec;
 
-use crate::device_registry::InputDevice;
+use crate::device_registry::{DeviceRegistry, InputDevice};
+#[cfg(target_os = "windows")]
+use windows::Win32::Foundation::HANDLE;
 
 /// Common Linux controller features
 #[cfg(target_os = "linux")]
@@ -26,5 +28,20 @@ impl<T: InputDevice> LinuxControllerExt for T {
     default fn has_touchpad(&self) -> bool {
         // Only DualShock controllers have touchpads
         matches!(self.device_name(), "DualShock 4" | "DualSense")
+    }
+}
+
+pub fn register_controllers(registry: &mut DeviceRegistry) {
+    #[cfg(target_os = "windows")]
+    {
+        use crate::controllers::windows::{DirectInputDeviceSpec, XInputDeviceSpec};
+        
+        registry.register_device(DirectInputDeviceSpec);
+        registry.register_device(XInputDeviceSpec);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        registry.register_device(linux::DualShockDeviceSpec);
     }
 }
