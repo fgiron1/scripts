@@ -1,4 +1,4 @@
-use rusty_xinput::{XInputHandle, XInputState, XInputError};
+use rusty_xinput::{XInputHandle, XInputState};
 use crate::controller::{Controller, types::{ControllerEvent, Button, Axis, DeviceInfo}};
 use std::error::Error;
 
@@ -13,7 +13,11 @@ pub struct XInputController {
 
 impl XInputController {
     pub fn new() -> Result<Self, Box<dyn Error>> {
-        let handle = XInputHandle::load_default()?;
+        // Try to load XInput
+        let handle = match XInputHandle::load_default() {
+            Ok(handle) => handle,
+            Err(_) => return Err("Failed to load XInput".into()),
+        };
         
         // Try all four possible XInput ports
         for port in 0..4 {
@@ -55,15 +59,14 @@ impl Controller for XInputController {
         // Get current state
         let new_state = match self.handle.get_state(self.port) {
             Ok(state) => state,
-            Err(XInputError::DeviceNotConnected) => {
+            Err(_) => {
                 return Err("Controller disconnected".into());
             }
-            Err(e) => return Err(Box::new(e)),
         };
         
         // Process button changes
-        let old_buttons = self.last_state.gamepad.buttons.0;
-        let new_buttons = new_state.gamepad.buttons.0;
+        let old_buttons = self.last_state.raw.Gamepad.wButtons;
+        let new_buttons = new_state.raw.Gamepad.wButtons;
         
         if old_buttons != new_buttons {
             // Check each button
@@ -85,49 +88,49 @@ impl Controller for XInputController {
         }
         
         // Process left stick
-        if new_state.gamepad.thumb_lx != self.last_state.gamepad.thumb_lx {
+        if new_state.raw.Gamepad.sThumbLX != self.last_state.raw.Gamepad.sThumbLX {
             events.push(ControllerEvent::AxisMove {
                 axis: Axis::LeftStickX,
-                value: self.normalize_stick(new_state.gamepad.thumb_lx),
+                value: self.normalize_stick(new_state.raw.Gamepad.sThumbLX),
             });
         }
         
-        if new_state.gamepad.thumb_ly != self.last_state.gamepad.thumb_ly {
+        if new_state.raw.Gamepad.sThumbLY != self.last_state.raw.Gamepad.sThumbLY {
             events.push(ControllerEvent::AxisMove {
                 axis: Axis::LeftStickY,
                 // Invert Y axis to match expected behavior (up is positive)
-                value: self.normalize_stick(new_state.gamepad.thumb_ly) * -1.0,
+                value: self.normalize_stick(new_state.raw.Gamepad.sThumbLY) * -1.0,
             });
         }
         
         // Process right stick
-        if new_state.gamepad.thumb_rx != self.last_state.gamepad.thumb_rx {
+        if new_state.raw.Gamepad.sThumbRX != self.last_state.raw.Gamepad.sThumbRX {
             events.push(ControllerEvent::AxisMove {
                 axis: Axis::RightStickX,
-                value: self.normalize_stick(new_state.gamepad.thumb_rx),
+                value: self.normalize_stick(new_state.raw.Gamepad.sThumbRX),
             });
         }
         
-        if new_state.gamepad.thumb_ry != self.last_state.gamepad.thumb_ry {
+        if new_state.raw.Gamepad.sThumbRY != self.last_state.raw.Gamepad.sThumbRY {
             events.push(ControllerEvent::AxisMove {
                 axis: Axis::RightStickY,
                 // Invert Y axis to match expected behavior (up is positive)
-                value: self.normalize_stick(new_state.gamepad.thumb_ry) * -1.0,
+                value: self.normalize_stick(new_state.raw.Gamepad.sThumbRY) * -1.0,
             });
         }
         
         // Process triggers
-        if new_state.gamepad.left_trigger != self.last_state.gamepad.left_trigger {
+        if new_state.raw.Gamepad.bLeftTrigger != self.last_state.raw.Gamepad.bLeftTrigger {
             events.push(ControllerEvent::AxisMove {
                 axis: Axis::L2,
-                value: self.normalize_trigger(new_state.gamepad.left_trigger),
+                value: self.normalize_trigger(new_state.raw.Gamepad.bLeftTrigger),
             });
         }
         
-        if new_state.gamepad.right_trigger != self.last_state.gamepad.right_trigger {
+        if new_state.raw.Gamepad.bRightTrigger != self.last_state.raw.Gamepad.bRightTrigger {
             events.push(ControllerEvent::AxisMove {
                 axis: Axis::R2,
-                value: self.normalize_trigger(new_state.gamepad.right_trigger),
+                value: self.normalize_trigger(new_state.raw.Gamepad.bRightTrigger),
             });
         }
         
