@@ -5,6 +5,7 @@ use std::time::Duration;
 use std::thread;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
+use crate::config::{AXIS_MAPPINGS, BUTTON_MAPPINGS};
 use crate::controller::{Controller, types::{ControllerEvent, Button, Axis, DeviceInfo}};
 use crate::controller::profiles::{self, ControllerProfile};
 
@@ -115,24 +116,31 @@ impl HidController {
         print!("\x1B[2J\x1B[H");
         
         // Print static headers
-        println!("DualShock Controller Debug - {}", self.device_info.product);
-        println!("========================================");
+        println!("DualShock Controller Debug - Wireless Controller");
         println!("Press buttons on your controller to see input events");
         println!("Press Ctrl+C to exit\n");
         
-        // Static labels for input values
-        println!("Left Stick X:  ");
-        println!("Left Stick Y:  ");
-        println!("Right Stick X: ");
-        println!("Right Stick Y: ");
-        println!("Left Trigger:  ");
-        println!("Right Trigger: ");
-        println!("D-Pad:         ");
+        // Static labels for input values - exactly matching screenshot
+        println!("ANALOG INPUTS                | MIDI MAPPING");
+        println!("------------------------------|----------------------------");
+        println!("Left Stick X:                | CC");
+        println!("Left Stick Y:                | CC");
+        println!("Right Stick X:               | CC");
+        println!("Right Stick Y:               | CC");
+        println!("Left Trigger:                | CC");
+        println!("Right Trigger:               | CC");
+        println!("D-Pad:                       | No notes ON");
         println!("");
-        println!("Face Buttons:  ");
-        println!("Shoulder:      ");
-        println!("Stick Press:   ");
-        println!("Special:       ");
+        println!("BUTTONS                      | NOTE MAPPING");
+        println!("------------------------------|----------------------------");
+        println!("                 □:off  ×:off  ○:off  △:off  | □:0  ×:0  ○:0  △:0");
+        println!("                 L1:off  R1:off  L2:off  R2:off  | L1:0  R1:0  L2:0  R2:0");
+        println!("                 L3:off  R3:off                | L3:0  R3:0");
+        println!("                 SHARE:off  OPTIONS:off  PS:off  | SH:0  OPT:0  PS:0  TP:0");
+        println!("Face Buttons:");
+        println!("Shoulder:");
+        println!("Stick Press:");
+        println!("Special:");
         println!("");
         println!("Raw Button Bits:");
         println!("Raw HID Report:");
@@ -140,13 +148,12 @@ impl HidController {
         io::stdout().flush().unwrap();
     }
     
-    // Just update the data fields without changing structure
     fn update_debug_data(&self, data: &[u8]) {
         if !self.debug_mode || data.len() < 10 {
             return;
         }
         
-        // Calculate all values
+        // Get raw values from the actual data locations
         let left_x_raw = data[1];
         let left_y_raw = data[2];
         let right_x_raw = data[3];
@@ -162,7 +169,7 @@ impl HidController {
         let l2_norm = l2_raw as f32 / 255.0;
         let r2_norm = r2_raw as f32 / 255.0;
         
-        // Extract D-pad value
+        // Extract D-pad value (lower 4 bits of byte 5)
         let dpad = data[5] & 0x0F;
         let dpad_dir = match dpad {
             0 => "Up",
@@ -196,53 +203,130 @@ impl HidController {
         let ps_btn  = (data[7] & 0x01) != 0;
         let touchpad = (data[7] & 0x02) != 0;
         
-        // Position cursor and update each value - use fixed-width fields
+        // Find MIDI CC mappings for axes
+        let left_x_cc = AXIS_MAPPINGS.iter().find(|m| m.axis == Axis::LeftStickX).map(|m| m.cc).unwrap_or(0);
+        let left_y_cc = AXIS_MAPPINGS.iter().find(|m| m.axis == Axis::LeftStickY).map(|m| m.cc).unwrap_or(0);
+        let right_x_cc = AXIS_MAPPINGS.iter().find(|m| m.axis == Axis::RightStickX).map(|m| m.cc).unwrap_or(0);
+        let right_y_cc = AXIS_MAPPINGS.iter().find(|m| m.axis == Axis::RightStickY).map(|m| m.cc).unwrap_or(0);
+        let l2_cc = AXIS_MAPPINGS.iter().find(|m| m.axis == Axis::L2).map(|m| m.cc).unwrap_or(0);
+        let r2_cc = AXIS_MAPPINGS.iter().find(|m| m.axis == Axis::R2).map(|m| m.cc).unwrap_or(0);
         
-        // Analog inputs
-        print!("\x1B[5;15H{:3} ({:+.2})                ", left_x_raw, left_x_norm);
-        print!("\x1B[6;15H{:3} ({:+.2})                ", left_y_raw, left_y_norm);
-        print!("\x1B[7;15H{:3} ({:+.2})                ", right_x_raw, right_x_norm);
-        print!("\x1B[8;15H{:3} ({:+.2})                ", right_y_raw, right_y_norm);
-        print!("\x1B[9;15H{:3} ({:.2})                 ", l2_raw, l2_norm);
-        print!("\x1B[10;15H{:3} ({:.2})                ", r2_raw, r2_norm);
-        print!("\x1B[11;15H{:<18}          ", dpad_dir);
+        // Calculate MIDI CC values
+        let left_x_midi = ((left_x_norm + 1.0) / 2.0 * 127.0) as u8;
+        let left_y_midi = ((left_y_norm + 1.0) / 2.0 * 127.0) as u8;
+        let right_x_midi = ((right_x_norm + 1.0) / 2.0 * 127.0) as u8;
+        let right_y_midi = ((right_y_norm + 1.0) / 2.0 * 127.0) as u8;
+        let l2_midi = (l2_norm * 127.0) as u8;
+        let r2_midi = (r2_norm * 127.0) as u8;
         
-        // Button states - use consistent width fields
-        print!("\x1B[13;15H□:{:<5} ×:{:<5} ○:{:<5} △:{:<5}     ", 
+        // Find button note mappings
+        let square_note = BUTTON_MAPPINGS.iter().find(|m| m.button == Button::Square).map(|m| m.note).unwrap_or(0);
+        let cross_note = BUTTON_MAPPINGS.iter().find(|m| m.button == Button::Cross).map(|m| m.note).unwrap_or(0);
+        let circle_note = BUTTON_MAPPINGS.iter().find(|m| m.button == Button::Circle).map(|m| m.note).unwrap_or(0);
+        let triangle_note = BUTTON_MAPPINGS.iter().find(|m| m.button == Button::Triangle).map(|m| m.note).unwrap_or(0);
+        
+        let l1_note = BUTTON_MAPPINGS.iter().find(|m| m.button == Button::L1).map(|m| m.note).unwrap_or(0);
+        let r1_note = BUTTON_MAPPINGS.iter().find(|m| m.button == Button::R1).map(|m| m.note).unwrap_or(0);
+        let l2_note = BUTTON_MAPPINGS.iter().find(|m| m.button == Button::L2).map(|m| m.note).unwrap_or(0);
+        let r2_note = BUTTON_MAPPINGS.iter().find(|m| m.button == Button::R2).map(|m| m.note).unwrap_or(0);
+        
+        let l3_note = BUTTON_MAPPINGS.iter().find(|m| m.button == Button::L3).map(|m| m.note).unwrap_or(0);
+        let r3_note = BUTTON_MAPPINGS.iter().find(|m| m.button == Button::R3).map(|m| m.note).unwrap_or(0);
+        
+        let share_note = BUTTON_MAPPINGS.iter().find(|m| m.button == Button::Share).map(|m| m.note).unwrap_or(0);
+        let options_note = BUTTON_MAPPINGS.iter().find(|m| m.button == Button::Options).map(|m| m.note).unwrap_or(0);
+        let ps_note = BUTTON_MAPPINGS.iter().find(|m| m.button == Button::PS).map(|m| m.note).unwrap_or(0);
+        let touchpad_note = BUTTON_MAPPINGS.iter().find(|m| m.button == Button::Touchpad).map(|m| m.note).unwrap_or(0);
+        
+        let dpad_up_note = BUTTON_MAPPINGS.iter().find(|m| m.button == Button::DpadUp).map(|m| m.note).unwrap_or(0);
+        let dpad_down_note = BUTTON_MAPPINGS.iter().find(|m| m.button == Button::DpadDown).map(|m| m.note).unwrap_or(0);
+        let dpad_left_note = BUTTON_MAPPINGS.iter().find(|m| m.button == Button::DpadLeft).map(|m| m.note).unwrap_or(0);
+        let dpad_right_note = BUTTON_MAPPINGS.iter().find(|m| m.button == Button::DpadRight).map(|m| m.note).unwrap_or(0);
+    
+        print!("\x1B[7;28H{:3} ({:+.2}) | CC {:2} = {:3}", left_x_raw, left_x_norm, left_x_cc, left_x_midi);
+        print!("\x1B[8;28H{:3} ({:+.2}) | CC {:2} = {:3}", left_y_raw, left_y_norm, left_y_cc, left_y_midi);
+        print!("\x1B[9;28H{:3} ({:+.2}) | CC {:2} = {:3}", right_x_raw, right_x_norm, right_x_cc, right_x_midi);
+        print!("\x1B[10;28H{:3} ({:+.2}) | CC {:2} = {:3}", right_y_raw, right_y_norm, right_y_cc, right_y_midi);
+        print!("\x1B[11;28H{:3} ({:.2})  | CC {:2} = {:3}", l2_raw, l2_norm, l2_cc, l2_midi);
+        print!("\x1B[12;28HReleased    | No notes ON");
+        
+        // D-pad - show active notes based on direction
+        let dpad_notes = match dpad {
+            0 => format!("Note {} ON", dpad_up_note),
+            1 => format!("Notes {}, {} ON", dpad_up_note, dpad_right_note),
+            2 => format!("Note {} ON", dpad_right_note),
+            3 => format!("Notes {}, {} ON", dpad_down_note, dpad_right_note),
+            4 => format!("Note {} ON", dpad_down_note),
+            5 => format!("Notes {}, {} ON", dpad_down_note, dpad_left_note),
+            6 => format!("Note {} ON", dpad_left_note),
+            7 => format!("Notes {}, {} ON", dpad_up_note, dpad_left_note),
+            _ => format!("No notes ON"),
+        };
+        
+        print!("\x1B[13;28H{:<10} | {}", dpad_dir, dpad_notes);
+        
+        // Face buttons with active state and note mapping
+        print!("\x1B[16;17H□:{:<4} ×:{:<4} ○:{:<4} △:{:<4}", 
             if square   { "ON" } else { "off" },
             if cross    { "ON" } else { "off" },
             if circle   { "ON" } else { "off" },
             if triangle { "ON" } else { "off" });
             
-        print!("\x1B[14;15HL1:{:<5} R1:{:<5} L2:{:<5} R2:{:<5}  ", 
+        // Show note mappings for face buttons
+        print!(" | □:{:<2}  ×:{:<2}  ○:{:<2}  △:{:<2}", 
+            if square { square_note } else { 0 },
+            if cross { cross_note } else { 0 },
+            if circle { circle_note } else { 0 },
+            if triangle { triangle_note } else { 0 });
+        
+        // Shoulder buttons with active state and note mapping
+        print!("\x1B[17;17HL1:{:<4} R1:{:<4} L2:{:<4} R2:{:<4}", 
             if l1      { "ON" } else { "off" },
             if r1      { "ON" } else { "off" },
             if l2_btn  { "ON" } else { "off" },
             if r2_btn  { "ON" } else { "off" });
             
-        print!("\x1B[15;15HL3:{:<5} R3:{:<5}                    ", 
+        // Show note mappings for shoulder buttons
+        print!(" | L1:{:<2}  R1:{:<2}  L2:{:<2}  R2:{:<2}", 
+            if l1 { l1_note } else { 0 },
+            if r1 { r1_note } else { 0 },
+            if l2_btn { l2_note } else { 0 },
+            if r2_btn { r2_note } else { 0 });
+            
+        // Stick press buttons with active state and note mapping
+        print!("\x1B[18;17HL3:{:<4} R3:{:<4}               ", 
             if l3 { "ON" } else { "off" },
             if r3 { "ON" } else { "off" });
             
-        print!("\x1B[16;15HSHARE:{:<5} OPTIONS:{:<5} PS:{:<5} TOUCHPAD:{:<5}", 
+        // Show note mappings for stick presses
+        print!(" | L3:{:<2}  R3:{:<2}", 
+            if l3 { l3_note } else { 0 },
+            if r3 { r3_note } else { 0 });
+            
+        // Special buttons with active state and note mapping
+        print!("\x1B[19;17HSHARE:{:<4} OPTIONS:{:<4} PS:{:<4}", 
             if share    { "ON" } else { "off" },
             if options  { "ON" } else { "off" },
-            if ps_btn   { "ON" } else { "off" },
-            if touchpad { "ON" } else { "off" });
+            if ps_btn   { "ON" } else { "off" });
             
-        // Raw data - use fixed fields
-        print!("\x1B[18;15H{:08b} {:08b} {:08b}            ", data[5], data[6], data[7]);
+        // Show note mappings for special buttons
+        print!(" | SH:{:<2}  OPT:{:<2}  PS:{:<2}  TP:{:<2}", 
+            if share { share_note } else { 0 },
+            if options { options_note } else { 0 },
+            if ps_btn { ps_note } else { 0 },
+            if touchpad { touchpad_note } else { 0 });
+            
+        // Raw Button Bits and Raw HID Report
+        print!("\x1B[21;0HRaw Button Bits: {:08b} {:08b} {:08b}", data[5], data[6], data[7]);
         
-        // Raw HID report
-        print!("\x1B[19;15H");
+        print!("\x1B[22;0HRaw HID Report:  ");
         for i in 0..std::cmp::min(data.len(), 10) {
             print!("{:02X} ", data[i]);
         }
-        print!("                          ");
+        print!("                         ");
         
         io::stdout().flush().unwrap();
     }
-    
     // Parse HID report based on controller profile
     fn parse_hid_report(&mut self, data: &[u8]) -> Vec<ControllerEvent> {
         let mut events = Vec::new();
@@ -264,7 +348,7 @@ impl HidController {
         // SPECIFIC DUALSHOCK 4 MAPPING
         // ===========================================
         
-        // 1. Process buttons - buttons are individual bits in bytes 5, 6, and 7
+        // Process buttons - buttons are individual bits in bytes 5, 6, and 7
         
         // Square, Cross, Circle, Triangle (Byte 5)
         self.update_button_state(Button::Square, (data[5] & 0x10) != 0, &mut events);
@@ -286,7 +370,7 @@ impl HidController {
         self.update_button_state(Button::PS, (data[7] & 0x01) != 0, &mut events);
         self.update_button_state(Button::Touchpad, (data[7] & 0x02) != 0, &mut events);
         
-        // 2. Process D-pad which is in the lower 4 bits of byte 5
+        // Process D-pad which is in the lower 4 bits of byte 5
         let dpad = data[5] & 0x0F;
         
         // Map D-pad values to specific buttons
@@ -347,7 +431,7 @@ impl HidController {
             }
         }
         
-        // 3. Process analog sticks with reduced sensitivity to avoid flooding events
+        // Process analog sticks with reduced sensitivity to avoid flooding events
         
         // Left stick: bytes 1 and 2
         let left_x = self.normalize_stick_value(data[1], 0.10); // Increased deadzone
@@ -363,7 +447,7 @@ impl HidController {
         self.check_axis_changed(Axis::RightStickX, right_x, &mut events);
         self.check_axis_changed(Axis::RightStickY, right_y, &mut events);
         
-        // 4. Process triggers (bytes 8 and 9) with high threshold to reduce events
+        // Process triggers (bytes 8 and 9) with high threshold to reduce events
         let l2 = self.normalize_trigger_value(data[8]);
         let r2 = self.normalize_trigger_value(data[9]);
         
