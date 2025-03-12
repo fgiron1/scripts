@@ -1,8 +1,12 @@
 use std::collections::HashMap;
 use crate::controller::types::{Button, Axis, DeviceInfo, AxisConfig};
+use std::sync::OnceLock;
+
+// Profiles cache - initialize profiles only once
+static PROFILES_CACHE: OnceLock<Vec<ControllerProfile>> = OnceLock::new();
 
 /// Represents a controller's connection method
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionType {
     USB,
     Bluetooth,
@@ -37,14 +41,14 @@ pub enum DpadType {
 impl ControllerProfile {
     /// Check if this profile matches the given device info and connection type
     pub fn matches(&self, device_info: &DeviceInfo, conn_type: ConnectionType) -> bool {
-        // Only match if connection type matches
+        // Only match if connection type matches or is unknown
         if self.connection_type != ConnectionType::Unknown && 
            conn_type != ConnectionType::Unknown && 
            self.connection_type != conn_type {
             return false;
         }
         
-        // Match by VID/PID pair
+        // Match by VID/PID pair (exact match)
         if self.vid_pid_pairs.contains(&(device_info.vid, device_info.pid)) {
             return true;
         }
@@ -66,11 +70,15 @@ impl ControllerProfile {
         profile.description = format!("{} via Bluetooth", profile.description);
         
         // Adjust axis indices for Bluetooth offset
-        for (_, config) in &mut profile.axis_config {
-            config.byte_index += bt_offset;
+        let mut new_axis_config = HashMap::new();
+        for (axis, config) in &profile.axis_config {
+            let mut new_config = config.clone();
+            new_config.byte_index += bt_offset;
+            new_axis_config.insert(*axis, new_config);
         }
+        profile.axis_config = new_axis_config;
         
-        // Adjust button mapping
+        // Adjust button mapping for Bluetooth offset
         let mut new_button_map = HashMap::new();
         for (code, button) in &profile.button_map {
             let byte_index = (code >> 8) as usize;
@@ -80,7 +88,7 @@ impl ControllerProfile {
         }
         profile.button_map = new_button_map;
         
-        // Adjust D-pad
+        // Adjust D-pad for Bluetooth offset
         if let DpadType::Hat { byte_index, mask_values } = &profile.dpad_type {
             profile.dpad_type = DpadType::Hat {
                 byte_index: byte_index + bt_offset,
@@ -92,15 +100,15 @@ impl ControllerProfile {
     }
 }
 
-/// Profile factory to create basic controller profiles and their variants
+/// Profile factory to create controller profiles
 pub struct ProfileFactory;
 
 impl ProfileFactory {
-    /// Creates a DualShock 4 profile (works for v1 or v2) for USB connection
+    /// Creates a DualShock 4 profile (v1 or v2) for the specified connection type
     pub fn create_dualshock4_profile(version: u8, connection: ConnectionType) -> ControllerProfile {
         let mut base = Self::create_dualshock4_base();
         
-        // Set appropriate version info
+        // Set version-specific properties
         if version == 1 {
             base.name = "DualShock 4 v1".to_string();
             base.description = "Sony PlayStation 4 DualShock Controller v1 (CUH-ZCT1)".to_string();
@@ -319,55 +327,86 @@ impl ProfileFactory {
     }
 }
 
-/// Detect the connection type for a device
+/// Detect the connection type for a device based on name and properties
 pub fn detect_connection_type(device_info: &DeviceInfo) -> ConnectionType {
-    // Check for well-known Bluetooth indicators
-    if device_info.product.to_lowercase().contains("bluetooth") || 
-       device_info.product.to_lowercase().contains("wireless") {
+    // Check for Bluetooth indicators in product name
+    let product_lower = device_info.product.to_lowercase();
+    if product_lower.contains("bluetooth") || 
+       product_lower.contains("wireless") {
         return ConnectionType::Bluetooth;
     }
     
-    // Some specific cases
-    if device_info.vid == 0x054C { // Sony
-        // Sony DS4 has specific BT detection
-        // (typically needs more complex logic based on full HID descriptor)
-        return ConnectionType::USB; // Default to USB for safety
+    // Sony DualShock 4 v1 (CUH-ZCT1)
+    if device_info.vid == 0x054C && device_info.pid == 0x05C4 {
+        return ConnectionType::USB;
+    }
+    
+    // Sony DualShock 4 v2 (CUH-ZCT2)
+    if device_info.vid == 0x054C && device_info.pid == 0x09CC {
+        return ConnectionType::USB;
+    }
+    
+    // Sony DualShock 4 in Bluetooth mode
+    if device_info.vid == 0x054C && 
+       (device_info.pid == 0x05C5 || device_info.pid == 0x09C2) {
+        return ConnectionType::Bluetooth;
     }
     
     ConnectionType::Unknown
 }
 
-/// Create profiles for all known controllers - compatible with your existing code
-pub fn create_profiles() -> Vec<ControllerProfile> {
-    vec![
-        ProfileFactory::create_dualshock4_profile(1, ConnectionType::USB),
-        ProfileFactory::create_dualshock4_profile(1, ConnectionType::Bluetooth),
-        ProfileFactory::create_dualshock4_profile(2, ConnectionType::USB),
-        ProfileFactory::create_dualshock4_profile(2, ConnectionType::Bluetooth),
-        ProfileFactory::create_xbox_profile(),
-        ProfileFactory::create_generic_profile(),
-    ]
+/// Create profiles for all known controllers (lazy initialization pattern)
+pub fn create_profiles() -> &'static Vec<ControllerProfile> {
+    PROFILES_CACHE.get_or_init(|| {
+        vec![
+            ProfileFactory::create_dualshock4_profile(1, ConnectionType::USB),
+            ProfileFactory::create_dualshock4_profile(1, ConnectionType::Bluetooth),
+            ProfileFactory::create_dualshock4_profile(2, ConnectionType::USB),
+            ProfileFactory::create_dualshock4_profile(2, ConnectionType::Bluetooth),
+            ProfileFactory::create_xbox_profile(),
+            ProfileFactory::create_generic_profile(),
+        ]
+    })
 }
 
-/// Get the best profile for a specific device - compatible with your existing code
+/// Get the best profile for a specific device
 pub fn get_profile_for_device<'a>(device_info: &DeviceInfo, profiles: &'a [ControllerProfile]) -> Option<&'a ControllerProfile> {
     let connection_type = detect_connection_type(device_info);
     
-    // Try to match with connection type
+    // Detailed connection type detection for PlayStation controllers
+    let detailed_connection_type = if device_info.vid == 0x054C {
+        // Sony-specific detection logic
+        match device_info.pid {
+            // DS4 v1 Bluetooth
+            0x05C5 => ConnectionType::Bluetooth,
+            // DS4 v1 USB
+            0x05C4 => ConnectionType::USB,
+            // DS4 v2 Bluetooth
+            0x09C2 => ConnectionType::Bluetooth,
+            // DS4 v2 USB
+            0x09CC => ConnectionType::USB,
+            // Unknown
+            _ => connection_type
+        }
+    } else {
+        connection_type
+    };
+    
+    // Try to match with exact connection type
     for profile in profiles {
-        if profile.matches(device_info, connection_type) {
+        if profile.matches(device_info, detailed_connection_type) {
             return Some(profile);
         }
     }
     
-    // Try with unknown connection type
+    // Try with generic connection type
     for profile in profiles {
         if profile.matches(device_info, ConnectionType::Unknown) {
             return Some(profile);
         }
     }
     
-    // Return the generic profile as fallback
+    // Fallback to the generic profile
     profiles.last()
 }
 
