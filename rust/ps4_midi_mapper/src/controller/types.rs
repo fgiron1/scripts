@@ -9,8 +9,7 @@ pub enum ControllerEvent {
         axis: Axis,
         value: f32, // Normalized to range -1.0 to 1.0 (or 0.0 to 1.0 for triggers)
     },
-    #[cfg(target_os = "linux")]
-    TouchpadMove {
+    TouchpadMove {  // Available on all platforms
         x: Option<i32>,
         y: Option<i32>,
     },
@@ -49,10 +48,8 @@ pub enum Axis {
     RightStickY,
     L2,         // Left trigger analog
     R2,         // Right trigger analog
-    #[cfg(target_os = "linux")]
-    TouchpadX,
-    #[cfg(target_os = "linux")]
-    TouchpadY,
+    TouchpadX,  // Touchpad X coordinate (available on all platforms)
+    TouchpadY,  // Touchpad Y coordinate (available on all platforms)
     Unknown,
 }
 

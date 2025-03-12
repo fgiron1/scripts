@@ -141,7 +141,7 @@ impl MidiMapper {
         
         Ok(())
     }
-    #[cfg(target_os = "linux")]
+
     fn process_touchpad(&mut self, x: Option<i32>, y: Option<i32>) -> Result<(), Box<dyn Error>> {
         // Process touchpad X coordinate
         if let Some(x_value) = x {
@@ -229,7 +229,6 @@ impl MidiMapper {
                             ControllerEvent::AxisMove { axis, value } => {
                                 self.process_axis(axis, value)?;
                             },
-                            #[cfg(target_os = "linux")]
                             ControllerEvent::TouchpadMove { x, y } => {
                                 self.process_touchpad(x, y)?;
                             }

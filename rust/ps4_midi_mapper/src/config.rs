@@ -48,8 +48,6 @@ pub const AXIS_MAPPINGS: &[AxisMapping] = &[
     AxisMapping { axis: Axis::RightStickY, cc: 26 },
     AxisMapping { axis: Axis::L2, cc: 27 },
     AxisMapping { axis: Axis::R2, cc: 28 },
-    #[cfg(target_os = "linux")]
     AxisMapping { axis: Axis::TouchpadX, cc: 29 },
-    #[cfg(target_os = "linux")]
     AxisMapping { axis: Axis::TouchpadY, cc: 30 },
 ];

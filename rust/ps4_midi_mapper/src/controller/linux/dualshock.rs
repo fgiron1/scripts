@@ -1,16 +1,23 @@
+// Improvements for the Linux touchpad support in src/controller/linux/dualshock.rs
+
 use gilrs::{Gilrs, Event, Button as GilrsButton, Axis as GilrsAxis, EventType};
-use evdev::{Device, AbsoluteAxisType, InputEventKind};
+use evdev::{Device, AbsoluteAxisType, InputEventKind, EventType as EvdevEventType};
 use std::{fs, path::Path};
 use crate::controller::{Controller, types::{ControllerEvent, Button, Axis, DeviceInfo}};
 use std::error::Error;
+use std::collections::HashMap;
 
-const TOUCHPAD_VENDOR: &str = "Sony";
-const TOUCHPAD_PRODUCT: &str = "Wireless Controller";
+// Constants for the touchpad
+const TOUCHPAD_X_MAX: i32 = 1920;
+const TOUCHPAD_Y_MAX: i32 = 942;
 
 pub struct DualShockController {
     gilrs: Gilrs,
     touchpad_device: Option<Device>,
     gamepad_id: usize,
+    touchpad_x: i32,
+    touchpad_y: i32,
+    touchpad_active: bool,
 }
 
 impl DualShockController {
@@ -33,21 +40,39 @@ impl DualShockController {
             gilrs,
             touchpad_device,
             gamepad_id,
+            touchpad_x: 0,
+            touchpad_y: 0,
+            touchpad_active: false,
         })
     }
-    
+        
     fn find_touchpad_device() -> Result<Option<Device>, Box<dyn Error>> {
+        println!("Searching for touchpad device...");
+        
         for entry in fs::read_dir("/dev/input")? {
             let path = entry?.path();
             
             if let Ok(device) = Device::open(&path) {
                 // Check if this is the touchpad for a DualShock controller
                 if let Some(name) = device.name() {
-                    if name.contains(TOUCHPAD_PRODUCT) {
+                    println!("Found input device: {}", name);
+                    
+                    // Check if it's a touchpad
+                    if name.contains("Touchpad") || 
+                    name.contains("Touch") || 
+                    name.contains("SONY") || 
+                    name.contains("Sony") {
+                        
                         if let Some(abs_info) = device.supported_absolute_axes() {
-                            if abs_info.contains(AbsoluteAxisType::ABS_MT_POSITION_X) {
-                                // Found the touchpad
-                                device.grab()?;
+                            // Check for typical touchpad axes
+                            if abs_info.contains(AbsoluteAxisType::ABS_MT_POSITION_X) ||
+                            abs_info.contains(AbsoluteAxisType::ABS_MT_TRACKING_ID) ||
+                            abs_info.contains(AbsoluteAxisType::ABS_X) {
+                                
+                                println!("Found touchpad device: {}", name);
+                                
+                                // Try to grab the device - if it fails, we'll still try to use it
+                                let _ = device.grab();
                                 return Ok(Some(device));
                             }
                         }
@@ -56,6 +81,7 @@ impl DualShockController {
             }
         }
         
+        println!("No touchpad device found");
         Ok(None)
     }
 }
@@ -105,24 +131,93 @@ impl Controller for DualShockController {
         
         // Process touchpad events if available
         if let Some(touchpad) = &mut self.touchpad_device {
+            // Track if we've seen X or Y changes in this batch
+            let mut x_updated = false;
+            let mut y_updated = false;
+            let mut touch_started = false;
+            let mut touch_ended = false;
+            
+            // Process all pending events from the touchpad
             for ev in touchpad.fetch_events()? {
-                if let InputEventKind::Absolute(abs_axis) = ev.kind() {
-                    match abs_axis.0 {
-                        0x35 => { // ABS_MT_POSITION_X
-                            events.push(ControllerEvent::TouchpadMove {
-                                x: Some(ev.value()),
-                                y: None,
-                            });
-                        }
-                        0x36 => { // ABS_MT_POSITION_Y
-                            events.push(ControllerEvent::TouchpadMove {
-                                x: None,
-                                y: Some(ev.value()),
-                            });
-                        }
-                        _ => {}
+                match ev.kind() {
+                    // Handle multitouch events
+                    InputEventKind::Absolute(AbsoluteAxisType::ABS_MT_POSITION_X) => {
+                        self.touchpad_x = ev.value();
+                        x_updated = true;
                     }
+                    InputEventKind::Absolute(AbsoluteAxisType::ABS_MT_POSITION_Y) => {
+                        self.touchpad_y = ev.value();
+                        y_updated = true;
+                    }
+                    // Handle tracking ID for touch start/end
+                    InputEventKind::Absolute(AbsoluteAxisType::ABS_MT_TRACKING_ID) => {
+                        if ev.value() == -1 {
+                            touch_ended = true;
+                        } else {
+                            touch_started = true;
+                            self.touchpad_active = true;
+                        }
+                    }
+                    // Handle normal absolute events (single touch)
+                    InputEventKind::Absolute(AbsoluteAxisType::ABS_X) => {
+                        self.touchpad_x = ev.value();
+                        x_updated = true;
+                    }
+                    InputEventKind::Absolute(AbsoluteAxisType::ABS_Y) => {
+                        self.touchpad_y = ev.value();
+                        y_updated = true;
+                    }
+                    // Key events for touch/release
+                    InputEventKind::Key(code) => {
+                        // Key code 330 is typically BTN_TOUCH
+                        if code.0 == 330 {
+                            if ev.value() == 1 {
+                                touch_started = true;
+                                self.touchpad_active = true;
+                            } else if ev.value() == 0 {
+                                touch_ended = true;
+                            }
+                        }
+                    }
+                    // Sync event indicates the end of an event packet
+                    InputEventKind::Synchronization(_) => {
+                        // If we have new coordinates and touch is active, send them
+                        if self.touchpad_active && (x_updated || y_updated) {
+                            events.push(ControllerEvent::TouchpadMove {
+                                x: if x_updated { Some(self.touchpad_x) } else { None },
+                                y: if y_updated { Some(self.touchpad_y) } else { None },
+                            });
+                            
+                            // Also map to axes for MIDI mapping
+                            if x_updated {
+                                let x_norm = (self.touchpad_x as f32 / TOUCHPAD_X_MAX as f32) * 2.0 - 1.0;
+                                events.push(ControllerEvent::AxisMove {
+                                    axis: Axis::TouchpadX,
+                                    value: x_norm,
+                                });
+                            }
+                            
+                            if y_updated {
+                                // Invert Y since touchpad coordinates are top-to-bottom
+                                let y_norm = -((self.touchpad_y as f32 / TOUCHPAD_Y_MAX as f32) * 2.0 - 1.0);
+                                events.push(ControllerEvent::AxisMove {
+                                    axis: Axis::TouchpadY,
+                                    value: y_norm,
+                                });
+                            }
+                        }
+                        
+                        // Reset trackers
+                        x_updated = false;
+                        y_updated = false;
+                    }
+                    _ => {}
                 }
+            }
+            
+            // Update touchpad active state
+            if touch_ended && !touch_started {
+                self.touchpad_active = false;
             }
         }
         
@@ -139,6 +234,7 @@ impl Controller for DualShockController {
     }
 }
 
+// Mapping functions remain the same
 fn map_button(button: GilrsButton) -> Option<Button> {
     match button {
         GilrsButton::South => Some(Button::Cross),
