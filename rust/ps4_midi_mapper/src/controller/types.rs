@@ -56,6 +56,60 @@ pub enum Axis {
     Unknown,
 }
 
+/// Configuration for controller axes
+#[derive(Debug, Clone)]
+pub struct AxisConfig {
+    pub byte_index: usize,       // Index in the HID report
+    pub center_value: u8,        // Center/rest value (typically 128 for sticks, 0 for triggers)
+    pub range: u8,               // Full range of the axis
+    pub invert: bool,            // Whether to invert the axis values
+    pub deadzone: f32,           // Deadzone as a percentage (0.0-1.0)
+    pub is_trigger: bool,        // True for triggers (0.0-1.0 range), false for sticks (-1.0-1.0 range)
+}
+
+impl AxisConfig {
+    /// Normalize a raw axis value based on this configuration
+    pub fn normalize(&self, raw_value: u8) -> f32 {
+        if self.is_trigger {
+            // Triggers map from 0-range to 0.0-1.0
+            let value = raw_value as f32 / self.range as f32;
+            
+            // Apply deadzone
+            if value < self.deadzone {
+                return 0.0;
+            }
+            
+            // Rescale to use full range
+            let scaled = (value - self.deadzone) / (1.0 - self.deadzone);
+            return if self.invert { 1.0 - scaled } else { scaled };
+        } else {
+            // Sticks map from 0-255 to -1.0-1.0 with center at center_value
+            let centered = (raw_value as i16) - (self.center_value as i16);
+            let mut normalized = centered as f32 / self.range as f32;
+            
+            // Invert if necessary
+            if self.invert {
+                normalized = -normalized;
+            }
+            
+            // Apply deadzone
+            if normalized.abs() < self.deadzone {
+                return 0.0;
+            }
+            
+            // Rescale values outside deadzone to use full range
+            let rescaled = (normalized.abs() - self.deadzone) / (1.0 - self.deadzone);
+            
+            // Apply original sign
+            if normalized < 0.0 {
+                -rescaled.min(1.0)
+            } else {
+                rescaled.min(1.0)
+            }
+        }
+    }
+}
+
 /// Basic device information
 #[derive(Debug, Clone)]
 pub struct DeviceInfo {

@@ -6,11 +6,7 @@ use std::thread;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use crate::controller::{Controller, types::{ControllerEvent, Button, Axis, DeviceInfo}};
-
-// Constants for PS4 controller
-const SONY_VID: u16 = 0x054C;
-const DS4_V1_PID: u16 = 0x05C4;
-const DS4_V2_PID: u16 = 0x09CC;
+use crate::controller::profiles::{self, ControllerProfile};
 
 // Static to track if display has been initialized
 static DISPLAY_INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -22,6 +18,7 @@ pub struct HidController {
     axis_values: HashMap<Axis, f32>,
     last_report: Vec<u8>,
     debug_mode: bool,
+    profile: ControllerProfile,
 }
 
 impl HidController {
@@ -30,11 +27,18 @@ impl HidController {
         let api = HidApi::new()?;
         
         // Try to find a PlayStation 4 controller
-        let (device, device_info) = Self::find_ps4_controller(&api)?;
+        let (device, device_info) = Self::find_controller(&api)?;
         
         // Disable mapper's display by setting an environment variable
         std::env::set_var("PS4_DISABLE_MAPPER_DISPLAY", "1");
-        
+
+        // Get a suitable profile for this controller
+        let profiles = profiles::create_profiles();
+        let profile = match profiles::get_profile_for_device(&device_info, &profiles) {
+            Some(profile) => profile.clone(),
+            None => profiles::create_generic_profile(),
+        };
+        println!("Using controller profile: {}", profile.name);
         println!("Found controller: {} (VID: 0x{:04X}, PID: 0x{:04X})", 
             device_info.product, device_info.vid, device_info.pid);
         
@@ -46,19 +50,30 @@ impl HidController {
             axis_values: HashMap::new(),
             last_report: vec![0; 64],  // Default buffer size
             debug_mode: true,          // Enable debug mode by default
+            profile,
         })
     }
     
-    fn find_ps4_controller(api: &HidApi) -> Result<(HidDevice, DeviceInfo), Box<dyn Error>> {
+    // Find any compatible controller
+    fn find_controller(api: &HidApi) -> Result<(HidDevice, DeviceInfo), Box<dyn Error>> {
         println!("Searching for controllers...");
         
-        // First try looking for PS4 controllers by vendor/product ID
+        // Check all connected HID devices
         for device_info in api.device_list() {
-            if device_info.vendor_id() == SONY_VID && 
-               (device_info.product_id() == DS4_V1_PID || 
-                device_info.product_id() == DS4_V2_PID) {
+            // Get product name from the device info
+            let product_name = match device_info.product_string() {
+                Some(name) => name,
+                None => continue,
+            };
+            
+            // Look for devices that are likely to be controllers
+            if product_name.contains("Controller") || 
+               product_name.contains("Gamepad") || 
+               product_name.contains("DualShock") ||
+               product_name.contains("Xbox") {
                 
-                // For DS4, we want the interface that provides full controller data
+                // For controllers, we want the interface that provides full controller data
+                // This condition may need to be adjusted for different controller types
                 let is_input_interface = 
                     (device_info.usage_page() == 0x01 && device_info.usage() == 0x05) ||
                     (device_info.interface_number() == 0);
@@ -69,13 +84,10 @@ impl HidController {
                         // Get string info
                         let manufacturer = match device.get_manufacturer_string() {
                             Ok(Some(s)) => s,
-                            _ => "Sony".to_string(),
+                            _ => "Unknown".to_string(),
                         };
                             
-                        let product = match device.get_product_string() {
-                            Ok(Some(s)) => s,
-                            _ => "DualShock 4".to_string(),
-                        };
+                        let product = product_name.to_string();
                         
                         // Create device info
                         let dev_info = DeviceInfo {
@@ -90,38 +102,6 @@ impl HidController {
                         
                         return Ok((device, dev_info));
                     }
-                }
-            }
-        }
-        
-        // If exact PS4 controller not found, try looking for any controller-like device
-        for device_info in api.device_list() {
-            // Get product name from the device info
-            let product_name = match device_info.product_string() {
-                Some(name) => name,
-                None => continue,
-            };
-            
-            if product_name.contains("Controller") || 
-               product_name.contains("Gamepad") || 
-               product_name.contains("DualShock") {
-                
-                if let Ok(device) = api.open_path(device_info.path()) {
-                    // Get string info
-                    let manufacturer = match device.get_manufacturer_string() {
-                        Ok(Some(s)) => s,
-                        _ => "Unknown".to_string(),
-                    };
-                    
-                    // Create device info
-                    let dev_info = DeviceInfo {
-                        vid: device_info.vendor_id(),
-                        pid: device_info.product_id(),
-                        manufacturer,
-                        product: product_name.to_string(),
-                    };
-                    
-                    return Ok((device, dev_info));
                 }
             }
         }
@@ -174,10 +154,11 @@ impl HidController {
         let l2_raw = data[8];
         let r2_raw = data[9];
         
-        let left_x_norm = self.normalize_axis_value(left_x_raw);
-        let left_y_norm = -self.normalize_axis_value(left_y_raw);
-        let right_x_norm = self.normalize_axis_value(right_x_raw);
-        let right_y_norm = -self.normalize_axis_value(right_y_raw);
+        // Use a fixed deadzone of 0.05 for debug display
+        let left_x_norm = self.normalize_stick_value(left_x_raw, 0.05);
+        let left_y_norm = -self.normalize_stick_value(left_y_raw, 0.05);
+        let right_x_norm = self.normalize_stick_value(right_x_raw, 0.05);
+        let right_y_norm = -self.normalize_stick_value(right_y_raw, 0.05);
         let l2_norm = l2_raw as f32 / 255.0;
         let r2_norm = r2_raw as f32 / 255.0;
         
@@ -262,7 +243,8 @@ impl HidController {
         io::stdout().flush().unwrap();
     }
     
-    fn parse_ds4_report(&mut self, data: &[u8]) -> Vec<ControllerEvent> {
+    // Parse HID report based on controller profile
+    fn parse_hid_report(&mut self, data: &[u8]) -> Vec<ControllerEvent> {
         let mut events = Vec::new();
         
         // Setup display if needed
@@ -271,7 +253,7 @@ impl HidController {
             DISPLAY_INITIALIZED.store(true, Ordering::Relaxed);
         }
         
-        // Update live data
+        // Update live data display
         self.update_debug_data(data);
         
         // Only proceed if we have enough data
@@ -279,24 +261,18 @@ impl HidController {
             return events;
         }
         
-        // Process D-pad which is in the lower 4 bits of byte 5
-        let dpad = data[5] & 0x0F;
+        // SPECIFIC DUALSHOCK 4 MAPPING
+        // ===========================================
         
-        self.check_dpad_button(Button::DpadUp, dpad, &[0, 1, 7], &mut events);
-        self.check_dpad_button(Button::DpadRight, dpad, &[1, 2, 3], &mut events);
-        self.check_dpad_button(Button::DpadDown, dpad, &[3, 4, 5], &mut events);
-        self.check_dpad_button(Button::DpadLeft, dpad, &[5, 6, 7], &mut events);
+        // 1. Process buttons - buttons are individual bits in bytes 5, 6, and 7
         
-        // Extract button data from bytes 5, 6, and 7
-        // Standard DualShock 4 v1 button mapping documentation
-        
-        // Byte 5 (upper 4 bits)
+        // Square, Cross, Circle, Triangle (Byte 5)
         self.update_button_state(Button::Square, (data[5] & 0x10) != 0, &mut events);
         self.update_button_state(Button::Cross, (data[5] & 0x20) != 0, &mut events);
         self.update_button_state(Button::Circle, (data[5] & 0x40) != 0, &mut events);
         self.update_button_state(Button::Triangle, (data[5] & 0x80) != 0, &mut events);
         
-        // Byte 6
+        // L1, R1, L2, R2, Share, Options, L3, R3 (Byte 6)
         self.update_button_state(Button::L1, (data[6] & 0x01) != 0, &mut events);
         self.update_button_state(Button::R1, (data[6] & 0x02) != 0, &mut events);
         self.update_button_state(Button::L2, (data[6] & 0x04) != 0, &mut events);
@@ -306,35 +282,97 @@ impl HidController {
         self.update_button_state(Button::L3, (data[6] & 0x40) != 0, &mut events);
         self.update_button_state(Button::R3, (data[6] & 0x80) != 0, &mut events);
         
-        // Byte 7
+        // PS button, Touchpad (Byte 7)
         self.update_button_state(Button::PS, (data[7] & 0x01) != 0, &mut events);
         self.update_button_state(Button::Touchpad, (data[7] & 0x02) != 0, &mut events);
         
-        // Process analog sticks
+        // 2. Process D-pad which is in the lower 4 bits of byte 5
+        let dpad = data[5] & 0x0F;
+        
+        // Map D-pad values to specific buttons
+        match dpad {
+            0 => { // Up
+                self.update_button_state(Button::DpadUp, true, &mut events);
+                self.update_button_state(Button::DpadDown, false, &mut events);
+                self.update_button_state(Button::DpadLeft, false, &mut events);
+                self.update_button_state(Button::DpadRight, false, &mut events);
+            },
+            1 => { // Up + Right
+                self.update_button_state(Button::DpadUp, true, &mut events);
+                self.update_button_state(Button::DpadDown, false, &mut events);
+                self.update_button_state(Button::DpadLeft, false, &mut events);
+                self.update_button_state(Button::DpadRight, true, &mut events);
+            },
+            2 => { // Right
+                self.update_button_state(Button::DpadUp, false, &mut events);
+                self.update_button_state(Button::DpadDown, false, &mut events);
+                self.update_button_state(Button::DpadLeft, false, &mut events);
+                self.update_button_state(Button::DpadRight, true, &mut events);
+            },
+            3 => { // Down + Right
+                self.update_button_state(Button::DpadUp, false, &mut events);
+                self.update_button_state(Button::DpadDown, true, &mut events);
+                self.update_button_state(Button::DpadLeft, false, &mut events);
+                self.update_button_state(Button::DpadRight, true, &mut events);
+            },
+            4 => { // Down
+                self.update_button_state(Button::DpadUp, false, &mut events);
+                self.update_button_state(Button::DpadDown, true, &mut events);
+                self.update_button_state(Button::DpadLeft, false, &mut events);
+                self.update_button_state(Button::DpadRight, false, &mut events);
+            },
+            5 => { // Down + Left
+                self.update_button_state(Button::DpadUp, false, &mut events);
+                self.update_button_state(Button::DpadDown, true, &mut events);
+                self.update_button_state(Button::DpadLeft, true, &mut events);
+                self.update_button_state(Button::DpadRight, false, &mut events);
+            },
+            6 => { // Left
+                self.update_button_state(Button::DpadUp, false, &mut events);
+                self.update_button_state(Button::DpadDown, false, &mut events);
+                self.update_button_state(Button::DpadLeft, true, &mut events);
+                self.update_button_state(Button::DpadRight, false, &mut events);
+            },
+            7 => { // Up + Left
+                self.update_button_state(Button::DpadUp, true, &mut events);
+                self.update_button_state(Button::DpadDown, false, &mut events);
+                self.update_button_state(Button::DpadLeft, true, &mut events);
+                self.update_button_state(Button::DpadRight, false, &mut events);
+            },
+            _ => { // Released or invalid
+                self.update_button_state(Button::DpadUp, false, &mut events);
+                self.update_button_state(Button::DpadDown, false, &mut events);
+                self.update_button_state(Button::DpadLeft, false, &mut events);
+                self.update_button_state(Button::DpadRight, false, &mut events);
+            }
+        }
+        
+        // 3. Process analog sticks with reduced sensitivity to avoid flooding events
+        
         // Left stick: bytes 1 and 2
-        let left_x = self.normalize_axis_value(data[1]);
-        let left_y = -self.normalize_axis_value(data[2]);  // Invert Y for proper up/down
+        let left_x = self.normalize_stick_value(data[1], 0.10); // Increased deadzone
+        let left_y = -self.normalize_stick_value(data[2], 0.10); // Invert Y
         
         self.check_axis_changed(Axis::LeftStickX, left_x, &mut events);
         self.check_axis_changed(Axis::LeftStickY, left_y, &mut events);
         
         // Right stick: bytes 3 and 4
-        let right_x = self.normalize_axis_value(data[3]);
-        let right_y = -self.normalize_axis_value(data[4]);  // Invert Y
+        let right_x = self.normalize_stick_value(data[3], 0.10);
+        let right_y = -self.normalize_stick_value(data[4], 0.10); // Invert Y
         
         self.check_axis_changed(Axis::RightStickX, right_x, &mut events);
         self.check_axis_changed(Axis::RightStickY, right_y, &mut events);
         
-        // Triggers: bytes 8 (L2) and 9 (R2)
-        let l2 = data[8] as f32 / 255.0;
-        let r2 = data[9] as f32 / 255.0;
+        // 4. Process triggers (bytes 8 and 9) with high threshold to reduce events
+        let l2 = self.normalize_trigger_value(data[8]);
+        let r2 = self.normalize_trigger_value(data[9]);
         
         self.check_axis_changed(Axis::L2, l2, &mut events);
         self.check_axis_changed(Axis::R2, r2, &mut events);
         
         events
     }
-    
+
     fn update_button_state(&mut self, button: Button, pressed: bool, events: &mut Vec<ControllerEvent>) {
         let prev_state = self.button_states.get(&button).copied().unwrap_or(false);
         
@@ -349,29 +387,19 @@ impl HidController {
         }
     }
     
-    fn check_dpad_button(&mut self, button: Button, dpad_value: u8, active_values: &[u8], events: &mut Vec<ControllerEvent>) {
-        // Determine if the button should be pressed based on the D-pad value
-        let pressed = active_values.contains(&dpad_value);
-        
-        // Check if state changed
-        let prev_state = self.button_states.get(&button).copied().unwrap_or(false);
-        if pressed != prev_state {
-            events.push(ControllerEvent::ButtonPress {
-                button,
-                pressed,
-            });
-            
-            // Update internal state
-            self.button_states.insert(button, pressed);
-        }
-    }
-    
+    // Modified version with default sensitivity
     fn check_axis_changed(&mut self, axis: Axis, value: f32, events: &mut Vec<ControllerEvent>) {
-        // Check if value has changed enough to generate an event
-        let prev_value = self.axis_values.get(&axis).copied().unwrap_or(0.0);
+        // Get previous value
+        let previous = self.axis_values.get(&axis).copied().unwrap_or(0.0);
         
-        // Use a small threshold to avoid sending events for tiny changes
-        if (value - prev_value).abs() > 0.01 {
+        // Use different sensitivity based on axis type
+        let min_change = match axis {
+            Axis::L2 | Axis::R2 => 0.10, // Higher threshold for triggers
+            _ => 0.05,                   // Standard threshold for sticks
+        };
+        
+        // Only emit events if change is significant (reduced event frequency)
+        if (value - previous).abs() > min_change {
             events.push(ControllerEvent::AxisMove {
                 axis,
                 value,
@@ -382,10 +410,37 @@ impl HidController {
         }
     }
     
-    fn normalize_axis_value(&self, value: u8) -> f32 {
-        // Convert from 0-255 to -1.0 to 1.0
-        // First scale to -128 to 127, then divide by 128 to get -1.0 to 0.992...
-        ((value as i16) - 128) as f32 / 128.0
+    // Normalize stick values with deadzone
+    fn normalize_stick_value(&self, value: u8, deadzone: f32) -> f32 {
+        // Center is at 128 for DS4 sticks
+        let centered = (value as f32) - 128.0;
+        let normalized = centered / 128.0;
+        
+        // Apply deadzone
+        if normalized.abs() < deadzone {
+            return 0.0;
+        }
+        
+        // Rescale values outside deadzone to use full range (-1.0 to 1.0)
+        let sign = if normalized < 0.0 { -1.0 } else { 1.0 };
+        let rescaled = sign * ((normalized.abs() - deadzone) / (1.0 - deadzone));
+        
+        // Clamp to valid range
+        rescaled.max(-1.0).min(1.0)
+    }
+    
+    // Normalize trigger values (0-255 to 0-1 range)
+    fn normalize_trigger_value(&self, value: u8) -> f32 {
+        // Triggers go from 0 (released) to 255 (fully pressed)
+        let normalized = value as f32 / 255.0;
+        
+        // Apply small deadzone to avoid noise at rest position
+        if normalized < 0.05 {
+            return 0.0;
+        }
+        
+        // Round to reduce number of events (only report 10 distinct values)
+        (normalized * 10.0).round() / 10.0
     }
 }
 
@@ -403,7 +458,7 @@ impl Controller for HidController {
                     self.last_report = buf[..size].to_vec();
                     
                     // Parse and return events
-                    return Ok(self.parse_ds4_report(&buf[..size]));
+                    return Ok(self.parse_hid_report(&buf[..size]));
                 }
             },
             Ok(_) => {

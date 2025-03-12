@@ -15,6 +15,7 @@ pub struct MidiMapper {
     axis_values: HashMap<Axis, f32>,
     display_info: Vec<(String, String, String)>,
     disable_display: bool,
+    last_midi_values: HashMap<u8, u8>,  // Added: Track last MIDI CC values sent
 }
 
 impl MidiMapper {
@@ -40,6 +41,7 @@ impl MidiMapper {
             axis_values: HashMap::new(),
             display_info: Vec::new(),
             disable_display,
+            last_midi_values: HashMap::new()
         })
     }
     
@@ -49,7 +51,6 @@ impl MidiMapper {
         ((value * 0.5 + 0.5) * 127.0).clamp(0.0, 127.0) as u8
     }
     
-    /// Process a controller button event
     fn process_button(&mut self, button: Button, pressed: bool) -> Result<(), Box<dyn Error>> {
         // Check if state has changed
         let previous = self.button_states.get(&button).copied().unwrap_or(false);
@@ -77,32 +78,55 @@ impl MidiMapper {
         
         Ok(())
     }
-    
-    /// Process a controller axis event
+
     fn process_axis(&mut self, axis: Axis, value: f32) -> Result<(), Box<dyn Error>> {
-        // Apply deadzone for analog sticks (not triggers)
-        let mut processed_value = value;
-        
-        if matches!(axis, 
-            Axis::LeftStickX | Axis::LeftStickY | Axis::RightStickX | Axis::RightStickY
-        ) && value.abs() < JOYSTICK_DEADZONE {
-            processed_value = 0.0;
+        // Skip processing if value hasn't changed significantly
+        let previous = self.axis_values.get(&axis).copied().unwrap_or(0.0);
+        if (value - previous).abs() < 0.05 {
+            return Ok(());
         }
         
-        // Check if value has changed significantly
-        let previous = self.axis_values.get(&axis).copied().unwrap_or(0.0);
-        let change = (processed_value - previous).abs();
+        // Apply deadzone differently per axis type
+        let processed_value = match axis {
+            // For analog sticks
+            Axis::LeftStickX | Axis::LeftStickY | Axis::RightStickX | Axis::RightStickY => {
+                if value.abs() < JOYSTICK_DEADZONE {
+                    0.0
+                } else {
+                    value
+                }
+            },
+            // For triggers - use as-is with no additional filtering
+            _ => value
+        };
         
-        // Only process if change is significant (reduces event spam)
-        if change > 0.01 {
-            // Update state
-            self.axis_values.insert(axis, processed_value);
+        // Update state even if we won't send a MIDI message
+        self.axis_values.insert(axis, processed_value);
+        
+        // Find mapping for this axis
+        if let Some(mapping) = AXIS_MAPPINGS.iter().find(|m| m.axis == axis) {
+            // Map to MIDI value
+            let midi_value = match axis {
+                // For triggers, map from 0.0-1.0 to 0-127
+                Axis::L2 | Axis::R2 => (processed_value * 127.0).round() as u8,
+                
+                // For sticks, map from -1.0-1.0 to 0-127 with center at 64
+                _ => {
+                    if processed_value <= -1.0 {
+                        0
+                    } else if processed_value >= 1.0 {
+                        127
+                    } else {
+                        ((processed_value + 1.0) * 63.5).round() as u8
+                    }
+                }
+            };
             
-            // Find mapping for this axis
-            if let Some(mapping) = AXIS_MAPPINGS.iter().find(|m| m.axis == axis) {
-                // Send MIDI CC message
-                let midi_value = Self::map_value(processed_value);
+            // Send MIDI only if value has actually changed
+            let prev_midi = self.last_midi_values.get(&mapping.cc).copied().unwrap_or(0);
+            if midi_value != prev_midi {
                 self.midi_sender.send_control_change(MIDI_CHANNEL, mapping.cc, midi_value)?;
+                self.last_midi_values.insert(mapping.cc, midi_value);
                 
                 // Update display if enabled
                 if !self.disable_display {
@@ -117,7 +141,6 @@ impl MidiMapper {
         
         Ok(())
     }
-    
     #[cfg(target_os = "linux")]
     fn process_touchpad(&mut self, x: Option<i32>, y: Option<i32>) -> Result<(), Box<dyn Error>> {
         // Process touchpad X coordinate
