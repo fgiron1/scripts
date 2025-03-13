@@ -7,6 +7,7 @@ pub mod linux;
 
 use types::{ControllerEvent, DeviceInfo};
 use std::error::Error;
+use std::any::Any;
 
 /// The main controller interface that all platform-specific implementations must provide
 pub trait Controller: Send {
@@ -15,6 +16,12 @@ pub trait Controller: Send {
     
     /// Get controller device information
     fn get_device_info(&self) -> DeviceInfo;
+    
+    /// Allow downcasting for specific controller types
+    fn as_any(&self) -> &dyn Any;
+    
+    /// Allow mutable downcasting for specific controller types
+    fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
 /// Create a controller instance appropriate for the current platform
