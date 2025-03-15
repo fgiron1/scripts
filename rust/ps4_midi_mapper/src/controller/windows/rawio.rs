@@ -1,24 +1,24 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::error::Error;
-use std::ptr::null;
 use std::mem::size_of;
 
 use windows::Win32::Foundation::{
-    HANDLE, HWND, INVALID_HANDLE_VALUE, CloseHandle, GetLastError, BOOL, FALSE, TRUE
+    HANDLE, HWND, INVALID_HANDLE_VALUE, CloseHandle, GetLastError, FALSE, TRUE, 
+    ERROR_DEVICE_NOT_CONNECTED, ERROR_IO_PENDING, WAIT_EVENT
 };
 
 use windows::Win32::Devices::HumanInterfaceDevice::{
     HidD_GetHidGuid, HidD_GetProductString, HidD_GetManufacturerString,
     HidD_FreePreparsedData, HidD_GetPreparsedData, HidD_GetAttributes, HidD_SetNumInputBuffers,
-    HidP_GetCaps, HidP_Input, HidP_GetValueCaps, HIDD_ATTRIBUTES, HIDP_CAPS, HIDP_VALUE_CAPS,
-    HIDP_STATUS_SUCCESS, PHIDP_PREPARSED_DATA
+    HidP_GetCaps, HidP_GetValueCaps, HIDD_ATTRIBUTES, HIDP_CAPS, HIDP_VALUE_CAPS,
+    HIDP_STATUS_SUCCESS, PHIDP_PREPARSED_DATA, HIDP_REPORT_TYPE
 };
 
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInterfaces,
     SetupDiGetClassDevsW, SetupDiGetDeviceInterfaceDetailW, DIGCF_DEVICEINTERFACE, DIGCF_PRESENT,
-    HDEVINFO, SP_DEVICE_INTERFACE_DATA, SP_DEVICE_INTERFACE_DETAIL_DATA_W, SP_DEVINFO_DATA
+    HDEVINFO, SP_DEVICE_INTERFACE_DATA, SP_DEVICE_INTERFACE_DETAIL_DATA_W
 };
 
 use windows::Win32::Storage::FileSystem::{
@@ -27,34 +27,31 @@ use windows::Win32::Storage::FileSystem::{
 };
 
 use windows::Win32::System::Threading::{
-    CreateEventW, WaitForSingleObject,
+    CreateEventW, WaitForSingleObject, ResetEvent
 };
 
 use windows::Win32::System::IO::{
-    GetOverlappedResult, OVERLAPPED,
+    CancelIoEx, GetOverlappedResult, OVERLAPPED
 };
 
 use windows::core::{GUID, PCWSTR};
 
 use crate::controller::{Controller, types::{ControllerEvent, Button, Axis, DeviceInfo}};
-use crate::controller::profiles::{ConnectionType, ControllerProfile, get_profile_for_device, create_profiles};
+use crate::controller::profiles::{ControllerProfile, get_profile_for_device, create_profiles};
 
-// Constants for touchpad
+// Constants
 const DS4_TOUCHPAD_X_MAX: i32 = 1920;
 const DS4_TOUCHPAD_Y_MAX: i32 = 942;
 const TOUCHPAD_MIN_CHANGE: i32 = 5;
-
-// We'll define these constants directly since they're missing
-const HIDP_LINK_COLLECTION_ROOT: u16 = 0;
 const WAIT_TIMEOUT: u32 = 258;
 const WAIT_OBJECT_0: u32 = 0;
+const READ_TIMEOUT_MS: u32 = 2; // Lower timeout for faster response
+const INPUT_BUFFER_SIZE: u32 = 64;
 
-// Structure to hold controller device information
 struct ControllerDevice {
     handle: HANDLE,
     device_info: DeviceInfo,
     preparsed_data: PHIDP_PREPARSED_DATA,
-    capabilities: HIDP_CAPS,
     value_caps: Vec<HIDP_VALUE_CAPS>,
     read_buffer: Vec<u8>,
     read_event: HANDLE,
@@ -67,29 +64,30 @@ struct ControllerDevice {
 impl Drop for ControllerDevice {
     fn drop(&mut self) {
         unsafe {
-            if !self.preparsed_data.is_null() {
+            if self.preparsed_data != PHIDP_PREPARSED_DATA::default() {
                 HidD_FreePreparsedData(self.preparsed_data);
-            }
-            
-            if self.handle != INVALID_HANDLE_VALUE {
-                CloseHandle(self.handle);
+                self.preparsed_data = PHIDP_PREPARSED_DATA::default();
             }
             
             if self.read_event != INVALID_HANDLE_VALUE {
                 CloseHandle(self.read_event);
+                self.read_event = INVALID_HANDLE_VALUE;
+            }
+            
+            if self.handle != INVALID_HANDLE_VALUE {
+                CloseHandle(self.handle);
+                self.handle = INVALID_HANDLE_VALUE;
             }
         }
     }
 }
 
-// Allow cloning by duplicating handles (simplified for example)
 impl Clone for ControllerDevice {
     fn clone(&self) -> Self {
         Self {
             handle: self.handle,
             device_info: self.device_info.clone(),
             preparsed_data: self.preparsed_data,
-            capabilities: self.capabilities,
             value_caps: self.value_caps.clone(),
             read_buffer: self.read_buffer.clone(),
             read_event: self.read_event,
@@ -101,37 +99,33 @@ impl Clone for ControllerDevice {
     }
 }
 
+// Make ControllerDevice thread-safe
+unsafe impl Send for ControllerDevice {}
+
 pub struct WindowsRawIOController {
     device: ControllerDevice,
     button_states: HashMap<Button, bool>,
     axis_values: HashMap<Axis, f32>,
-    
-    // Touchpad specific state
     touchpad_active: bool,
     touchpad_last_x: i32,
     touchpad_last_y: i32,
-    
-    // Debug mode
     debug_mode: bool,
-    
-    // Profile
     profile: Option<&'static ControllerProfile>,
 }
 
 impl WindowsRawIOController {
     pub fn new() -> Result<Self, Box<dyn Error>> {
-        println!("Creating Windows Raw IO Controller...");
-        
         // Find controller
         let device = Self::find_controller()?;
         
-        println!("Found controller: {} (VID: 0x{:04X}, PID: 0x{:04X})", 
-                 device.device_info.product, device.device_info.vid, device.device_info.pid);
+        // Pre-allocate hashmaps with capacity for lower latency
+        let mut button_states = HashMap::with_capacity(20);
+        let mut axis_values = HashMap::with_capacity(10);
         
         // Create controller instance
         let mut controller = WindowsRawIOController {
-            button_states: HashMap::new(),
-            axis_values: HashMap::new(),
+            button_states,
+            axis_values,
             touchpad_active: false,
             touchpad_last_x: 0,
             touchpad_last_y: 0,
@@ -140,30 +134,44 @@ impl WindowsRawIOController {
             profile: None,
         };
         
-        // Cache the profile
+        // Cache the profile for faster lookups
         controller.profile = Some(controller.get_controller_profile());
+        
+        println!("Connected to controller: {} (VID: 0x{:04X}, PID: 0x{:04X})", 
+                 controller.device.device_info.product, 
+                 controller.device.device_info.vid, 
+                 controller.device.device_info.pid);
         
         Ok(controller)
     }
     
     fn find_controller() -> Result<ControllerDevice, Box<dyn Error>> {
-        // Get HID GUID
-        let mut hid_guid = GUID::default();
-        unsafe { HidD_GetHidGuid(&mut hid_guid); }
+        println!("Searching for game controllers...");
         
-        // Get list of all HID devices
-        let device_info_set = unsafe {
+        // Get HID GUID
+        let hid_guid = unsafe { HidD_GetHidGuid() };
+        
+        // Get device interface list
+        let device_info_set = match unsafe {
             SetupDiGetClassDevsW(
-                &hid_guid,
+                Some(&hid_guid),
                 PCWSTR::null(),
                 HWND::default(),
                 DIGCF_DEVICEINTERFACE | DIGCF_PRESENT,
             )
+        } {
+            Ok(info_set) => info_set,
+            Err(e) => return Err(format!("Failed to get device information set: {}", e).into())
         };
-        
-        if device_info_set == HDEVINFO::default() {
-            return Err("Failed to get device information set".into());
+
+        // Ensure cleanup of the device info set when done
+        struct DeviceInfoSetCleanup(HDEVINFO);
+        impl Drop for DeviceInfoSetCleanup {
+            fn drop(&mut self) {
+                unsafe { SetupDiDestroyDeviceInfoList(self.0); }
+            }
         }
+        let _cleanup = DeviceInfoSetCleanup(device_info_set);
         
         // Prepare to enumerate devices
         let mut device_interface_data = SP_DEVICE_INTERFACE_DATA {
@@ -171,251 +179,320 @@ impl WindowsRawIOController {
             ..Default::default()
         };
         
-        let mut device_index = 0;
         let mut found_devices = Vec::new();
+        let mut device_index = 0;
         
         // Loop through devices
         loop {
-            let success = unsafe {
+            // Enumerate device interfaces
+            match unsafe { 
                 SetupDiEnumDeviceInterfaces(
                     device_info_set,
                     None,
                     &hid_guid,
                     device_index,
                     &mut device_interface_data,
-                )
-            };
-            
-            if !success.as_bool() {
-                let error = unsafe { GetLastError() };
-                if error.0 == 259 { // ERROR_NO_MORE_ITEMS
-                    break;
-                } else {
-                    unsafe { SetupDiDestroyDeviceInfoList(device_info_set) };
-                    return Err(format!("Error enumerating device interfaces: {}", error.0).into());
-                }
-            }
-            
-            // Get the device path size
-            let mut required_size = 0u32;
-            unsafe {
-                SetupDiGetDeviceInterfaceDetailW(
-                    device_info_set,
-                    &device_interface_data,
-                    None,
-                    0,
-                    &mut required_size,
-                    None,
-                )
-            };
-            
-            // Allocate buffer for device path
-            let mut device_interface_detail_data = vec![0u8; required_size as usize];
-            let p_device_interface_detail_data = device_interface_detail_data.as_mut_ptr() as *mut SP_DEVICE_INTERFACE_DETAIL_DATA_W;
-            
-            // Set the size field
-            unsafe {
-                (*p_device_interface_detail_data).cbSize = size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>() as u32;
-            }
-            
-            // Get device info data
-            let mut device_info_data = SP_DEVINFO_DATA {
-                cbSize: size_of::<SP_DEVINFO_DATA>() as u32,
-                ..Default::default()
-            };
-            
-            // Get device path
-            let success = unsafe {
-                SetupDiGetDeviceInterfaceDetailW(
-                    device_info_set,
-                    &device_interface_data,
-                    Some(p_device_interface_detail_data),
-                    required_size,
-                    &mut required_size,
-                    Some(&mut device_info_data),
-                )
-            };
-            
-            if !success.as_bool() {
-                device_index += 1;
-                continue;
-            }
-            
-            // Try to open the device
-            let device_handle = unsafe {
-                CreateFileW(
-                    PCWSTR((*p_device_interface_detail_data).DevicePath.as_ptr()),
-                    windows::Win32::Storage::FileSystem::FILE_GENERIC_READ | windows::Win32::Storage::FileSystem::FILE_GENERIC_WRITE,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE,
-                    null(),
-                    OPEN_EXISTING,
-                    FILE_FLAG_OVERLAPPED,
-                    HANDLE::default(),
-                )
-            };
-            
-            if device_handle == INVALID_HANDLE_VALUE {
-                device_index += 1;
-                continue;
-            }
-            
-            // Get device attributes
-            let mut attrs = HIDD_ATTRIBUTES {
-                Size: size_of::<HIDD_ATTRIBUTES>() as u32,
-                ..Default::default()
-            };
-            
-            let success = unsafe { HidD_GetAttributes(device_handle, &mut attrs) };
-            
-            if !success.as_bool() {
-                unsafe { CloseHandle(device_handle) };
-                device_index += 1;
-                continue;
-            }
-            
-            // Get device strings
-            let mut product_buffer = [0u16; 128];
-            let mut manufacturer_buffer = [0u16; 128];
-            
-            let has_product = unsafe {
-                HidD_GetProductString(device_handle, product_buffer.as_mut_ptr() as _, 
-                                     (product_buffer.len() * size_of::<u16>()) as u32)
-            }.as_bool();
-            
-            let has_manufacturer = unsafe {
-                HidD_GetManufacturerString(device_handle, manufacturer_buffer.as_mut_ptr() as _, 
-                                          (manufacturer_buffer.len() * size_of::<u16>()) as u32)
-            }.as_bool();
-            
-            // Convert strings from UTF-16
-            let product = if has_product {
-                let end = product_buffer.iter().position(|&c| c == 0).unwrap_or(product_buffer.len());
-                String::from_utf16_lossy(&product_buffer[0..end])
-            } else {
-                "Unknown".to_string()
-            };
-            
-            let manufacturer = if has_manufacturer {
-                let end = manufacturer_buffer.iter().position(|&c| c == 0).unwrap_or(manufacturer_buffer.len());
-                String::from_utf16_lossy(&manufacturer_buffer[0..end])
-            } else {
-                "Unknown".to_string()
-            };
-            
-            // Check if it's a controller
-            let is_controller = product.to_lowercase().contains("controller") || 
-                               product.to_lowercase().contains("gamepad") ||
-                               product.to_lowercase().contains("dualshock") ||
-                               product.to_lowercase().contains("xbox");
-            
-            // Only process controllers
-            if is_controller {
-                // Get device capabilities
-                let mut preparsed_data = PHIDP_PREPARSED_DATA::default();
-                let preparsed_result = unsafe { HidD_GetPreparsedData(device_handle, &mut preparsed_data) };
-                
-                if !preparsed_result.as_bool() || preparsed_data.is_null() {
-                    unsafe { CloseHandle(device_handle) };
-                    device_index += 1;
-                    continue;
-                }
-                
-                let mut caps = HIDP_CAPS::default();
-                let caps_result = unsafe { HidP_GetCaps(preparsed_data, &mut caps) };
-                
-                if caps_result != HIDP_STATUS_SUCCESS {
-                    unsafe {
-                        HidD_FreePreparsedData(preparsed_data);
-                        CloseHandle(device_handle);
+                ) 
+            } {
+                Ok(_) => {
+                    // Continue with this device
+                    if let Some(device) = Self::process_device_interface(device_info_set, &device_interface_data) {
+                        found_devices.push(device);
                     }
-                    device_index += 1;
-                    continue;
-                }
-                
-                // Get value capabilities
-                let mut value_caps_length = caps.NumberInputValueCaps;
-                let mut value_caps = Vec::with_capacity(value_caps_length as usize);
-                value_caps.resize(value_caps_length as usize, HIDP_VALUE_CAPS::default());
-                
-                let value_caps_result = unsafe {
-                    HidP_GetValueCaps(
-                        HidP_Input,
-                        value_caps.as_mut_ptr(),
-                        &mut value_caps_length,
-                        preparsed_data,
-                    )
-                };
-                
-                // Create read event
-                let read_event = unsafe { CreateEventW(null(), TRUE, FALSE, PCWSTR::null()) };
-                
-                if read_event == INVALID_HANDLE_VALUE {
-                    unsafe {
-                        HidD_FreePreparsedData(preparsed_data);
-                        CloseHandle(device_handle);
+                },
+                Err(e) => {
+                    // Check if this is just the end of enumeration
+                    let error_code = e.code().0;
+                    if error_code == 259 { // ERROR_NO_MORE_ITEMS
+                        break;
+                    } else {
+                        return Err(format!("Error enumerating device interfaces: {}", e).into());
                     }
-                    device_index += 1;
-                    continue;
                 }
-                
-                // Create overlapped structure
-                let mut read_overlapped = OVERLAPPED::default();
-                read_overlapped.hEvent = read_event;
-                
-                // Set buffer size
-                unsafe { HidD_SetNumInputBuffers(device_handle, 64) };
-                
-                // Check if it's a DualShock controller
-                let is_dualshock = product.to_lowercase().contains("dualshock") ||
-                                  product.to_lowercase().contains("wireless controller");
-                                  
-                // Check if it's Bluetooth connected (for DualShock)
-                let is_bluetooth = is_dualshock && 
-                                  (attrs.ProductID == 0x05C5 || attrs.ProductID == 0x09C2);
-                
-                // Create the device info
-                let device_info = DeviceInfo {
-                    vid: attrs.VendorID,
-                    pid: attrs.ProductID,
-                    manufacturer,
-                    product,
-                };
-                
-                // Create read buffer based on report length
-                let report_length = caps.InputReportByteLength as u32;
-                let read_buffer = vec![0u8; report_length as usize];
-                
-                // Add this device to found devices
-                found_devices.push(ControllerDevice {
-                    handle: device_handle,
-                    device_info,
-                    preparsed_data,
-                    capabilities: caps,
-                    value_caps: value_caps[0..value_caps_length as usize].to_vec(),
-                    read_buffer,
-                    read_event,
-                    read_overlapped,
-                    report_length,
-                    is_dualshock,
-                    is_bluetooth,
-                });
-            } else {
-                unsafe { CloseHandle(device_handle) };
-            }
+            };
             
             device_index += 1;
         }
         
-        // Clean up
-        unsafe { SetupDiDestroyDeviceInfoList(device_info_set) };
-        
         // Find the best device
+        Self::select_best_controller(found_devices)
+    }
+    
+    fn process_device_interface(
+        device_info_set: HDEVINFO, 
+        device_interface_data: &SP_DEVICE_INTERFACE_DATA
+    ) -> Option<ControllerDevice> {
+        // Get the device path size
+        let mut required_size = 0u32;
+        unsafe {
+            SetupDiGetDeviceInterfaceDetailW(
+                device_info_set,
+                device_interface_data,
+                None,
+                0,
+                Some(&mut required_size),
+                None,
+            )
+        };
+        
+        if required_size == 0 {
+            return None;
+        }
+        
+        // Allocate buffer for device path
+        let mut device_interface_detail_data = vec![0u8; required_size as usize];
+        let p_device_interface_detail_data = device_interface_detail_data.as_mut_ptr() 
+            as *mut SP_DEVICE_INTERFACE_DETAIL_DATA_W;
+        
+        // Set the cbSize field correctly
+        unsafe {
+            (*p_device_interface_detail_data).cbSize = if cfg!(target_pointer_width = "64") {
+                8 // 64-bit size
+            } else {
+                6 // 32-bit size
+            };
+        }
+        
+        // Get device interface detail
+        let detail_result = unsafe {
+            SetupDiGetDeviceInterfaceDetailW(
+                device_info_set,
+                device_interface_data,
+                Some(p_device_interface_detail_data),
+                required_size,
+                Some(&mut required_size),
+                None,
+            )
+        };
+        
+        if detail_result.is_err() {
+            return None;
+        }
+        
+        // Get the device path
+        let device_path = unsafe {
+            PCWSTR((*p_device_interface_detail_data).DevicePath.as_ptr())
+        };
+        
+        // Try to open the device
+        let device_handle_result = unsafe {
+            CreateFileW(
+                device_path,
+                0x80000000 | 0x40000000,  // GENERIC_READ | GENERIC_WRITE
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAG_OVERLAPPED, // Important for async I/O
+                HANDLE::default(),
+            )
+        };
+
+        let device_handle = match device_handle_result {
+            Ok(handle) => handle,
+            Err(_) => return None,
+        };
+
+        if device_handle.is_invalid() {
+            return None;
+        }
+        
+        // Initialize the device
+        Self::initialize_hid_device(device_handle)
+    }
+    
+    fn initialize_hid_device(device_handle: HANDLE) -> Option<ControllerDevice> {
+        // Get device attributes
+        let mut attrs = HIDD_ATTRIBUTES {
+            Size: size_of::<HIDD_ATTRIBUTES>() as u32,
+            ..Default::default()
+        };
+        
+        if !unsafe { HidD_GetAttributes(device_handle, &mut attrs) }.as_bool() {
+            unsafe { CloseHandle(device_handle) };
+            return None;
+        }
+        
+        // Get device strings
+        let (product, manufacturer) = Self::get_device_strings(device_handle);
+        
+        // Check if it's a controller
+        let is_controller = product.to_lowercase().contains("controller") || 
+                           product.to_lowercase().contains("gamepad") ||
+                           product.to_lowercase().contains("dualshock") ||
+                           product.to_lowercase().contains("xbox");
+        
+        if !is_controller {
+            unsafe { CloseHandle(device_handle) };
+            return None;
+        }
+        
+        // Get device capabilities
+        let mut preparsed_data = PHIDP_PREPARSED_DATA::default();
+        if !unsafe { HidD_GetPreparsedData(device_handle, &mut preparsed_data) }.as_bool() || 
+           preparsed_data == PHIDP_PREPARSED_DATA::default() {
+            unsafe { CloseHandle(device_handle) };
+            return None;
+        }
+        
+        let mut caps = HIDP_CAPS::default();
+        if unsafe { HidP_GetCaps(preparsed_data, &mut caps) } != HIDP_STATUS_SUCCESS {
+            unsafe {
+                HidD_FreePreparsedData(preparsed_data);
+                CloseHandle(device_handle);
+            }
+            return None;
+        }
+        
+        // Get value capabilities
+        let value_caps = Self::get_value_caps(preparsed_data, caps.NumberInputValueCaps);
+        
+        // Create read event
+        let read_event_result = unsafe { 
+            CreateEventW(
+                None,
+                TRUE,  
+                FALSE, 
+                PCWSTR::null()
+            ) 
+        };
+        
+        let read_event = match read_event_result {
+            Ok(event) => event,
+            Err(_) => {
+                unsafe {
+                    HidD_FreePreparsedData(preparsed_data);
+                    CloseHandle(device_handle);
+                }
+                return None;
+            }
+        };
+        
+        if read_event.is_invalid() {
+            unsafe {
+                HidD_FreePreparsedData(preparsed_data);
+                CloseHandle(device_handle);
+            }
+            return None;
+        }
+        
+        // Create overlapped structure
+        let mut read_overlapped = OVERLAPPED::default();
+        read_overlapped.hEvent = read_event;
+        
+        // Set buffer size for better throughput
+        unsafe { HidD_SetNumInputBuffers(device_handle, INPUT_BUFFER_SIZE) };
+        
+        // Check if it's a DualShock controller
+        let is_dualshock = product.to_lowercase().contains("dualshock") ||
+                          (product.to_lowercase().contains("wireless controller") && 
+                           manufacturer.to_lowercase().contains("sony"));
+                          
+        // Check if it's Bluetooth connected
+        let is_bluetooth = is_dualshock && 
+                         (attrs.ProductID == 0x05C5 || // DS4 v1 Bluetooth
+                          attrs.ProductID == 0x09C2);  // DS4 v2 Bluetooth
+        
+        // Create the device info
+        let device_info = DeviceInfo {
+            vid: attrs.VendorID,
+            pid: attrs.ProductID,
+            manufacturer,
+            product,
+        };
+        
+        // Create read buffer based on report length
+        let report_length = caps.InputReportByteLength as u32;
+        let read_buffer = vec![0u8; report_length as usize];
+        
+        Some(ControllerDevice {
+            handle: device_handle,
+            device_info,
+            preparsed_data,
+            value_caps,
+            read_buffer,
+            read_event,
+            read_overlapped,
+            report_length,
+            is_dualshock,
+            is_bluetooth,
+        })
+    }
+    
+    fn get_device_strings(device_handle: HANDLE) -> (String, String) {
+        let mut product_buffer = [0u16; 128];
+        let mut manufacturer_buffer = [0u16; 128];
+        
+        let has_product = unsafe {
+            HidD_GetProductString(
+                device_handle, 
+                product_buffer.as_mut_ptr() as _, 
+                (product_buffer.len() * size_of::<u16>()) as u32
+            )
+        }.as_bool();
+        
+        let has_manufacturer = unsafe {
+            HidD_GetManufacturerString(
+                device_handle, 
+                manufacturer_buffer.as_mut_ptr() as _, 
+                (manufacturer_buffer.len() * size_of::<u16>()) as u32
+            )
+        }.as_bool();
+        
+        // Convert strings from UTF-16
+        let product = if has_product {
+            let end = product_buffer.iter().position(|&c| c == 0).unwrap_or(product_buffer.len());
+            String::from_utf16_lossy(&product_buffer[0..end])
+        } else {
+            "Unknown".to_string()
+        };
+        
+        let manufacturer = if has_manufacturer {
+            let end = manufacturer_buffer.iter().position(|&c| c == 0).unwrap_or(manufacturer_buffer.len());
+            String::from_utf16_lossy(&manufacturer_buffer[0..end])
+        } else {
+            "Unknown".to_string()
+        };
+        
+        (product, manufacturer)
+    }
+    
+    fn get_value_caps(preparsed_data: PHIDP_PREPARSED_DATA, count: u16) -> Vec<HIDP_VALUE_CAPS> {
+        let mut value_caps = Vec::new();
+        
+        if count > 0 {
+            let mut value_caps_buffer = vec![HIDP_VALUE_CAPS::default(); count as usize];
+            let mut value_caps_length = count;
+            
+            let value_caps_result = unsafe {
+                HidP_GetValueCaps(
+                    HIDP_REPORT_TYPE(0),  // HidP_Input
+                    value_caps_buffer.as_mut_ptr(),
+                    &mut value_caps_length,
+                    preparsed_data,
+                )
+            };
+            
+            if value_caps_result == HIDP_STATUS_SUCCESS {
+                value_caps = value_caps_buffer[0..value_caps_length as usize].to_vec();
+            }
+        }
+        
+        value_caps
+    }
+    
+    fn select_best_controller(found_devices: Vec<ControllerDevice>) -> Result<ControllerDevice, Box<dyn Error>> {
+        if found_devices.is_empty() {
+            return Err("No compatible controller found".into());
+        }
         
         // First priority: DualShock 4 controllers
         for device in &found_devices {
             if device.is_dualshock &&
                (device.device_info.pid == 0x05C4 || // DS4 v1
-                device.device_info.pid == 0x09CC) { // DS4 v2
+                device.device_info.pid == 0x09CC || // DS4 v2
+                device.device_info.pid == 0x05C5 || // DS4 v1 Bluetooth
+                device.device_info.pid == 0x09C2) { // DS4 v2 Bluetooth
+                
                 return Ok(device.clone());
             }
         }
@@ -427,17 +504,13 @@ impl WindowsRawIOController {
             }
         }
         
-        // Last resort: Any game controller
-        if let Some(device) = found_devices.first() {
-            return Ok(device.clone());
-        }
-        
-        Err("No compatible controller found".into())
+        // Last resort: First controller in the list
+        Ok(found_devices[0].clone())
     }
-    
+
     // Get the controller profile
     fn get_controller_profile(&self) -> &'static ControllerProfile {
-        // If we already have a cached profile, return it
+        // Use cached profile if available
         if let Some(profile) = self.profile {
             return profile;
         }
@@ -454,82 +527,93 @@ impl WindowsRawIOController {
         profiles.last().expect("At least one profile should exist")
     }
     
-    // Read data from the device
+    // Read data from the device - optimized for low latency
     fn read_device_data(&mut self) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
-        // Prepare read buffer
-        let mut bytes_read = 0u32;
-        
-        // Reset the overlapped structure
-        self.device.read_overlapped.Internal = 0;
-        self.device.read_overlapped.InternalHigh = 0;
-        self.device.read_overlapped.Anonymous.Anonymous.Offset = 0;
-        self.device.read_overlapped.Anonymous.Anonymous.OffsetHigh = 0;
-        
-        // Start the read operation
-        let read_result = unsafe {
-            ReadFile(
+        unsafe {
+            // Reset the event
+            ResetEvent(self.device.read_event);
+            
+            // Reset the overlapped structure - critical for reliability
+            self.device.read_overlapped.Internal = 0;
+            self.device.read_overlapped.InternalHigh = 0;
+            self.device.read_overlapped.Anonymous.Anonymous.Offset = 0;
+            self.device.read_overlapped.Anonymous.Anonymous.OffsetHigh = 0;
+            self.device.read_overlapped.hEvent = self.device.read_event;
+            
+            let mut bytes_read = 0u32;
+            
+            // Start the read operation
+            match ReadFile(
                 self.device.handle,
-                self.device.read_buffer.as_mut_ptr() as _,
-                self.device.report_length,
-                &mut bytes_read,
-                &mut self.device.read_overlapped,
-            )
-        };
-        
-        if !read_result.as_bool() {
-            let error = unsafe { GetLastError() };
-            
-            // If the operation is pending, wait for it
-            if error.0 != 997 { // ERROR_IO_PENDING
-                return Err(format!("Error reading from device: {}", error.0).into());
+                Some(&mut self.device.read_buffer),
+                Some(&mut bytes_read),
+                Some(&mut self.device.read_overlapped),
+            ) {
+                Ok(_) => {
+                    // Immediate success
+                    if bytes_read > 0 {
+                        return Ok(Some(self.device.read_buffer[0..bytes_read as usize].to_vec()));
+                    }
+                    return Ok(None);
+                },
+                Err(e) => {
+                    // Check if pending
+                    let error = GetLastError();
+                    if error != ERROR_IO_PENDING {
+                        return Err(format!("Error reading from device: {}", e).into());
+                    }
+                    
+                    // Wait with short timeout for lowest latency
+                    let wait_result = WaitForSingleObject(self.device.read_event, READ_TIMEOUT_MS);
+                    
+                    if wait_result == WAIT_EVENT(WAIT_TIMEOUT) {
+                        // No data ready yet, cancel and return
+                        CancelIoEx(self.device.handle, Some(&self.device.read_overlapped));
+                        return Ok(None);
+                    }
+                    
+                    if wait_result != WAIT_EVENT(WAIT_OBJECT_0) {
+                        return Err(format!("Wait error: {}", GetLastError().0).into());
+                    }
+                    
+                    // Get the result
+                    match GetOverlappedResult(
+                        self.device.handle,
+                        &mut self.device.read_overlapped,
+                        &mut bytes_read,
+                        FALSE,
+                    ) {
+                        Ok(_) => {
+                            if bytes_read > 0 {
+                                return Ok(Some(self.device.read_buffer[0..bytes_read as usize].to_vec()));
+                            }
+                        },
+                        Err(e) => {
+                            let error = GetLastError();
+                            if error == ERROR_DEVICE_NOT_CONNECTED {
+                                return Err("Controller disconnected".into());
+                            }
+                            return Err(format!("Error getting read result: {}", e).into());
+                        }
+                    }
+                }
             }
             
-            // Wait for the read to complete with a short timeout (5ms)
-            let wait_result = unsafe { 
-                WaitForSingleObject(self.device.read_event, 5)
-            };
-            
-            if wait_result == WAIT_TIMEOUT {
-                // No data available yet
-                return Ok(None);
-            }
-            
-            // Get the result
-            let get_result = unsafe {
-                GetOverlappedResult(
-                    self.device.handle,
-                    &mut self.device.read_overlapped,
-                    &mut bytes_read,
-                    FALSE,
-                )
-            };
-            
-            if !get_result.as_bool() {
-                let error = unsafe { GetLastError() };
-                return Err(format!("Error getting read result: {}", error.0).into());
-            }
+            Ok(None)
         }
-        
-        // If we got data, return it
-        if bytes_read > 0 {
-            return Ok(Some(self.device.read_buffer.clone()));
-        }
-        
-        // No data
-        Ok(None)
     }
-    
-    // Parse the raw data from the device
+
+    // Parse the raw data from the device - optimized for speed
     fn parse_report(&mut self, data: &[u8], events: &mut Vec<ControllerEvent>) {
-        // Get the current profile
-        let profile = self.get_controller_profile();
-        
         // First data received - detect Bluetooth mode for DS4
         if self.device.is_dualshock && !self.device.is_bluetooth && data[0] == 0x11 {
             self.device.is_bluetooth = true;
         }
         
-        // Use profile-based mapping
+        // Get the cached profile
+        let profile = self.get_controller_profile();
+        
+        // Process buttons and axes
         self.parse_with_profile(data, profile, events);
         
         // For DualShock controllers, try to extract touchpad data
@@ -538,14 +622,13 @@ impl WindowsRawIOController {
         }
     }
     
-    // Parse using profile-based approach
+    // Profile-based input parsing
     fn parse_with_profile(&mut self, data: &[u8], profile: &ControllerProfile, events: &mut Vec<ControllerEvent>) {
         // Process buttons based on the profile's button map
         for (code, button) in &profile.button_map {
             let byte_index = (code >> 8) as usize;
-            let bit_mask = (*code & 0xFF) as u8;
-            
             if byte_index < data.len() {
+                let bit_mask = (*code & 0xFF) as u8;
                 let pressed = (data[byte_index] & bit_mask) != 0;
                 self.update_button(*button, pressed, events);
             }
@@ -560,18 +643,18 @@ impl WindowsRawIOController {
             }
         }
         
-        // Process D-pad based on the profile's D-pad type
+        // Process D-pad
         match &profile.dpad_type {
             crate::controller::profiles::DpadType::Hat { byte_index, mask_values } => {
                 if *byte_index < data.len() {
                     let hat_value = data[*byte_index];
                     if let Some(buttons) = mask_values.get(&hat_value) {
-                        // For each button in the current mask, set it to pressed
+                        // Process active buttons
                         for button in buttons {
                             self.update_button(*button, true, events);
                         }
                         
-                        // For each dpad button not in the current mask, set it to released
+                        // Release inactive buttons
                         let dpad_buttons = [Button::DpadUp, Button::DpadRight, Button::DpadDown, Button::DpadLeft];
                         for button in &dpad_buttons {
                             if !buttons.contains(button) {
@@ -582,10 +665,9 @@ impl WindowsRawIOController {
                 }
             },
             crate::controller::profiles::DpadType::Buttons => {
-                // Buttons are handled by the button map above
+                // Handled by button map
             },
             crate::controller::profiles::DpadType::Axes { x_axis, y_axis } => {
-                // Get axis values and convert to d-pad button presses
                 let x_value = self.axis_values.get(x_axis).copied().unwrap_or(0.0);
                 let y_value = self.axis_values.get(y_axis).copied().unwrap_or(0.0);
                 
@@ -606,15 +688,10 @@ impl WindowsRawIOController {
         // Different offsets based on connection type
         let touchpad_offset = if self.device.is_bluetooth { 35 } else { 33 };
         
-        // Check if we have enough data
+        // Check if enough data
         if data.len() <= touchpad_offset + 4 {
             return;
         }
-        
-        // DS4 touchpad data format:
-        // Byte 0: Touch state (bit 7: active when 0, bits 0-6: touch ID)
-        // Bytes 1-2: X position (12 bits)
-        // Bytes 2-3: Y position (12 bits)
         
         let touch_state = data[touchpad_offset];
         let is_touching = (touch_state & 0x80) == 0; // Active when bit 7 is 0
@@ -634,7 +711,7 @@ impl WindowsRawIOController {
         }
     }
     
-    // Update button state
+    // Update button state - only generate events on changes
     fn update_button(&mut self, button: Button, pressed: bool, events: &mut Vec<ControllerEvent>) {
         let prev_state = self.button_states.get(&button).copied().unwrap_or(false);
         
@@ -648,11 +725,11 @@ impl WindowsRawIOController {
         }
     }
     
-    // Update axis value
+    // Update axis value - apply thresholds to reduce MIDI traffic
     fn update_axis(&mut self, axis: Axis, value: f32, events: &mut Vec<ControllerEvent>) {
         let previous = self.axis_values.get(&axis).copied().unwrap_or(0.0);
         
-        // Use appropriate sensitivity threshold
+        // Use appropriate sensitivity threshold based on axis type
         let min_change = match axis {
             Axis::L2 | Axis::R2 => 0.05,               // Triggers
             Axis::TouchpadX | Axis::TouchpadY => 0.01, // Touchpad
@@ -704,12 +781,10 @@ impl WindowsRawIOController {
             self.touchpad_active = true;
             
             if self.debug_mode {
-                println!("Touchpad: X={}, Y={} (normalized: {:.2}, {:.2})", 
-                         x, y, x_norm, y_norm);
+                println!("Touchpad: X={}, Y={}", x, y);
             }
         }
     }
-    
     // Handle touch release
     fn end_touch(&mut self, events: &mut Vec<ControllerEvent>) {
         if self.touchpad_active {
@@ -727,7 +802,7 @@ impl WindowsRawIOController {
             });
             
             if self.debug_mode {
-                println!("Touchpad: Touch released");
+                println!("Touchpad: released");
             }
         }
     }
@@ -735,13 +810,14 @@ impl WindowsRawIOController {
     // Enable debug mode
     pub fn enable_debug(&mut self) {
         self.debug_mode = true;
-        println!("Debug mode enabled for Raw IO controller");
+        println!("Debug mode enabled");
     }
 }
 
 impl Controller for WindowsRawIOController {
     fn poll_events(&mut self) -> Result<Vec<ControllerEvent>, Box<dyn Error>> {
-        let mut events = Vec::new();
+        // Pre-allocate events vector to reduce allocations
+        let mut events = Vec::with_capacity(10);
         
         // Try to read data from the device
         match self.read_device_data() {
@@ -750,7 +826,7 @@ impl Controller for WindowsRawIOController {
                 self.parse_report(&data, &mut events);
             },
             Ok(None) => {
-                // No data available, that's fine
+                // No data available yet, that's fine
             },
             Err(e) => {
                 return Err(format!("Error reading from controller: {}", e).into());
@@ -772,3 +848,6 @@ impl Controller for WindowsRawIOController {
         self
     }
 }
+
+// Make ControllerDevice implement Send by wrapping pointers
+// Add this impl to make your ControllerDevice thread-safe
