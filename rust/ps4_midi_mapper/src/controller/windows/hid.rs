@@ -1,12 +1,8 @@
 use hidapi::{HidApi, HidDevice};
 use std::error::Error;
 use std::collections::HashMap;
-use std::time::Duration;
-use std::thread;
-use std::io::{self, Write};
 use std::any::Any;
 use crate::controller::{Controller, types::{ControllerEvent, Button, Axis, DeviceInfo}};
-use crate::controller::profiles::{self};
 
 // Constants for touchpad processing
 const TOUCHPAD_UPDATE_THRESHOLD: i32 = 5; // Lower threshold for more responsive touchpad
@@ -109,6 +105,15 @@ impl Controller for HidController {
     fn get_device_info(&self) -> DeviceInfo {
         self.device_info.clone()
     }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
 }
 
 impl HidController {
@@ -364,9 +369,9 @@ impl HidController {
         // Try to locate potential 2-byte X/Y coordinates throughout the buffer
         for offset in 0..data.len().saturating_sub(4) {
             // Look for values that could be valid coordinates
-            let x1 = ((data[offset] as i32) | ((data[offset + 1] as i32) << 8));
+            let x1 = (data[offset] as i32) | ((data[offset + 1] as i32) << 8);
             let y1 = if offset + 3 < data.len() {
-                ((data[offset + 2] as i32) | ((data[offset + 3] as i32) << 8))
+                (data[offset + 2] as i32) | ((data[offset + 3] as i32) << 8)
             } else {
                 0
             };
@@ -402,9 +407,9 @@ impl HidController {
         if !self.touchpad_tracking {
             for offset in 0..data.len().saturating_sub(2) {
                 // Try single-byte coordinates
-                let x2 = (data[offset] as i32 * DS4_TOUCHPAD_X_MAX / 255);
+                let x2 = data[offset] as i32 * DS4_TOUCHPAD_X_MAX / 255;
                 let y2 = if offset + 1 < data.len() { 
-                    (data[offset + 1] as i32 * DS4_TOUCHPAD_Y_MAX / 255)
+                    data[offset + 1] as i32 * DS4_TOUCHPAD_Y_MAX / 255
                 } else {
                     0
                 };

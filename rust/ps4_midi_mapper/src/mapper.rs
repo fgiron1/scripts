@@ -210,8 +210,7 @@ impl MidiMapper {
                         thread::sleep(Duration::from_millis(100));
                     }
                 }
-            }
-            
+            }            
             // Sleep to prevent excessive CPU usage, but keep latency low
             thread::sleep(Duration::from_millis(1));
         }
