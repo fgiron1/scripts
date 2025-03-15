@@ -251,7 +251,7 @@ impl WindowsRawIOController {
                     OPEN_EXISTING,
                     FILE_FLAG_OVERLAPPED,
                     HANDLE::default(),
-                )?
+                )
             };
             
             if device_handle == INVALID_HANDLE_VALUE {
