@@ -12,6 +12,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Display app header
     println!("PS4/Controller MIDI Mapper");
     println!("==========================");
+    println!("Version 0.1.0");
+    
+    #[cfg(target_os = "windows")]
+    println!("Platform: Windows");
+    #[cfg(target_os = "linux")]
+    println!("Platform: Linux");
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    println!("Platform: Unsupported");
     
     // List available MIDI ports
     println!("\nAvailable MIDI ports:");
@@ -101,7 +109,31 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("\nConnected controller: {} ({:04X}:{:04X})", 
         device_info.product, device_info.vid, device_info.pid);
     println!("Manufacturer: {}", device_info.manufacturer);
-    println!("\nControls are now being mapped to MIDI. Any controller input will be sent to your MIDI device.");
     
-    mapper.run()
+    // Display mapping information
+    println!("\nButton mappings:");
+    for mapping in config::BUTTON_MAPPINGS {
+        println!("  {:10} -> MIDI Note {}", 
+            format!("{:?}", mapping.button), mapping.note);
+    }
+    
+    println!("\nAxis mappings:");
+    for mapping in config::AXIS_MAPPINGS {
+        println!("  {:12} -> MIDI CC {}", 
+            format!("{:?}", mapping.axis), mapping.cc);
+    }
+    
+    println!("\nControls are now being mapped to MIDI. Any controller input will be sent to your MIDI device.");
+    println!("Press Ctrl+C to exit.");
+    
+    // Run the mapper
+    match mapper.run() {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            eprintln!("\nError during mapping: {}", e);
+            println!("\nPress Enter to exit...");
+            let _ = io::stdin().read_line(&mut String::new());
+            Err(e)
+        }
+    }
 }

@@ -1,12 +1,14 @@
-use std::error::Error;
-use std::thread;
+// src/mapper.rs updates to improve integration with controller profiles
+
+use std::env;
 use std::time::Duration;
 use std::collections::HashMap;
-use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::error::Error;
 
 use crate::config::{MIDI_CHANNEL, JOYSTICK_DEADZONE, BUTTON_MAPPINGS, AXIS_MAPPINGS};
-use crate::controller::{Controller, types::{ControllerEvent, Button, Axis}};
+use crate::controller::{Controller, types::{ControllerEvent, Button, Axis}, profiles::{get_profile_for_device, create_profiles}};
 use crate::midi::MidiSender;
 
 // Static flag to reduce repeated environment checks
@@ -37,10 +39,21 @@ impl MidiMapper {
         // Create controller
         let controller = crate::controller::create_controller()?;
         
-        // Get controller info
+        // Get controller info and profile
         let device_info = controller.get_device_info();
+        
+        // Try to find a matching profile for display purposes
+        let profiles = create_profiles();
+        let profile_name = if let Some(profile) = get_profile_for_device(&device_info, profiles) {
+            profile.name.clone()
+        } else {
+            "Generic".to_string()
+        };
+        
         println!("\nConnected controller: {} ({:04X}:{:04X})", 
             device_info.product, device_info.vid, device_info.pid);
+        println!("Manufacturer: {}", device_info.manufacturer);
+        println!("Using profile: {}", profile_name);
         
         Ok(Self {
             midi_sender,
@@ -178,11 +191,16 @@ impl MidiMapper {
         
         // Main loop
         let mut last_poll_time = std::time::Instant::now();
+        let mut consecutive_errors = 0;
+        let max_consecutive_errors = 5;
         
         loop {
             // Poll controller for events
             match self.controller.poll_events() {
                 Ok(events) => {
+                    // Reset error counter on success
+                    consecutive_errors = 0;
+                    
                     for event in events {
                         match event {
                             ControllerEvent::ButtonPress { button, pressed } => {
@@ -208,6 +226,14 @@ impl MidiMapper {
                     // If this was a disconnect, let's wait a bit longer
                     if e.to_string().contains("disconnect") {
                         thread::sleep(Duration::from_millis(100));
+                    }
+                    
+                    // Count consecutive errors
+                    consecutive_errors += 1;
+                    
+                    // If we've had too many consecutive errors, return an error
+                    if consecutive_errors > max_consecutive_errors {
+                        return Err(format!("Too many consecutive errors: {}", e).into());
                     }
                 }
             }            
