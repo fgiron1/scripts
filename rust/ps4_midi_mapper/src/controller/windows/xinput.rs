@@ -2,7 +2,7 @@
 
 use rusty_xinput::{XInputHandle, XInputState};
 use crate::controller::{Controller, types::{ControllerEvent, Button, Axis, DeviceInfo}};
-use std::error::Error;
+use std::{any::Any, error::Error};
 use std::collections::HashMap;
 
 // XInput constants
@@ -231,5 +231,13 @@ impl Controller for XInputController {
             manufacturer: "Microsoft".to_string(),
             product: "Xbox Controller".to_string(),
         }
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
