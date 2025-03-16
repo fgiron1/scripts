@@ -185,22 +185,15 @@ impl MidiMapper {
     
     /// Main processing loop
     pub fn run(&mut self) -> Result<(), Box<dyn Error>> {
-        // Initial setup message
-        println!("\nMapping controller to MIDI...");
-        println!("Press Ctrl+C to exit.");
-        
-        // Main loop
-        let mut last_poll_time = std::time::Instant::now();
-        let mut consecutive_errors = 0;
-        let max_consecutive_errors = 5;
-        
+        // Remove unused variables or mark them with underscore
+        let _last_poll_time = std::time::Instant::now();
+        let _consecutive_errors = 0;
+        let _max_consecutive_errors = 5;
+    
+        // Main processing loop
         loop {
-            // Poll controller for events
             match self.controller.poll_events() {
                 Ok(events) => {
-                    // Reset error counter on success
-                    consecutive_errors = 0;
-                    
                     for event in events {
                         match event {
                             ControllerEvent::ButtonPress { button, pressed } => {
@@ -216,29 +209,13 @@ impl MidiMapper {
                     }
                 },
                 Err(e) => {
-                    // Only report errors after a timeout to prevent error spam
-                    let now = std::time::Instant::now();
-                    if now.duration_since(last_poll_time) > Duration::from_millis(250) {
-                        println!("Controller error: {}", e);
-                        last_poll_time = now;
-                    }
-
-                    // If this was a disconnect, let's wait a bit longer
-                    if e.to_string().contains("disconnect") {
-                        thread::sleep(Duration::from_millis(100));
-                    }
-                    
-                    // Count consecutive errors
-                    consecutive_errors += 1;
-                    
-                    // If we've had too many consecutive errors, return an error
-                    if consecutive_errors > max_consecutive_errors {
-                        return Err(format!("Too many consecutive errors: {}", e).into());
-                    }
+                    println!("Controller connection lost: {}", e);
+                    println!("Please reconnect the controller and restart the application.");
+                    return Err(e);
                 }
-            }            
-            // Sleep to prevent excessive CPU usage, but keep latency low
-            thread::sleep(Duration::from_millis(1));
+            }
+            
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
 }

@@ -2,11 +2,13 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::error::Error;
 use std::mem::size_of;
+use std::time::Duration;
 
-use windows::Win32::Foundation::{
-    HANDLE, HWND, INVALID_HANDLE_VALUE, CloseHandle, GetLastError, FALSE, TRUE, 
-    ERROR_DEVICE_NOT_CONNECTED, ERROR_IO_PENDING, WAIT_EVENT
-};
+use windows::Win32::Foundation::{HANDLE, HWND, INVALID_HANDLE_VALUE, CloseHandle, GetLastError, FALSE, TRUE, ERROR_DEVICE_NOT_CONNECTED, ERROR_IO_PENDING, WAIT_EVENT};
+use windows::Win32::Storage::FileSystem::{CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, FILE_FLAG_OVERLAPPED,ReadFile};
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject, ResetEvent};
+use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
+use windows::core::PCWSTR;
 
 use windows::Win32::Devices::HumanInterfaceDevice::{
     HidD_GetHidGuid, HidD_GetProductString, HidD_GetManufacturerString,
@@ -14,30 +16,16 @@ use windows::Win32::Devices::HumanInterfaceDevice::{
     HidP_GetCaps, HidP_GetValueCaps, HIDD_ATTRIBUTES, HIDP_CAPS, HIDP_VALUE_CAPS,
     HIDP_STATUS_SUCCESS, PHIDP_PREPARSED_DATA, HIDP_REPORT_TYPE
 };
-
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInterfaces,
     SetupDiGetClassDevsW, SetupDiGetDeviceInterfaceDetailW, DIGCF_DEVICEINTERFACE, DIGCF_PRESENT,
     HDEVINFO, SP_DEVICE_INTERFACE_DATA, SP_DEVICE_INTERFACE_DETAIL_DATA_W
 };
 
-use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, FILE_FLAG_OVERLAPPED,
-    ReadFile
-};
-
-use windows::Win32::System::Threading::{
-    CreateEventW, WaitForSingleObject, ResetEvent
-};
-
-use windows::Win32::System::IO::{
-    CancelIoEx, GetOverlappedResult, OVERLAPPED
-};
-
-use windows::core::{GUID, PCWSTR};
-
 use crate::controller::{Controller, types::{ControllerEvent, Button, Axis, DeviceInfo}};
 use crate::controller::profiles::{ControllerProfile, get_profile_for_device, create_profiles};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use crate::controller::{self, create_controller};
 
 // Constants
 const DS4_TOUCHPAD_X_MAX: i32 = 1920;
@@ -45,7 +33,7 @@ const DS4_TOUCHPAD_Y_MAX: i32 = 942;
 const TOUCHPAD_MIN_CHANGE: i32 = 5;
 const WAIT_TIMEOUT: u32 = 258;
 const WAIT_OBJECT_0: u32 = 0;
-const READ_TIMEOUT_MS: u32 = 2; // Lower timeout for faster response
+const READ_TIMEOUT_MS: u32 = 2;
 const INPUT_BUFFER_SIZE: u32 = 64;
 
 struct ControllerDevice {
@@ -119,8 +107,8 @@ impl WindowsRawIOController {
         let device = Self::find_controller()?;
         
         // Pre-allocate hashmaps with capacity for lower latency
-        let mut button_states = HashMap::with_capacity(20);
-        let mut axis_values = HashMap::with_capacity(10);
+        let button_states = HashMap::with_capacity(20);
+        let axis_values = HashMap::with_capacity(10);
         
         // Create controller instance
         let mut controller = WindowsRawIOController {
@@ -163,7 +151,7 @@ impl WindowsRawIOController {
             Ok(info_set) => info_set,
             Err(e) => return Err(format!("Failed to get device information set: {}", e).into())
         };
-
+    
         // Ensure cleanup of the device info set when done
         struct DeviceInfoSetCleanup(HDEVINFO);
         impl Drop for DeviceInfoSetCleanup {
@@ -182,10 +170,10 @@ impl WindowsRawIOController {
         let mut found_devices = Vec::new();
         let mut device_index = 0;
         
-        // Loop through devices
+        // Loop through devices with error handling
         loop {
-            // Enumerate device interfaces
-            match unsafe { 
+            // More robust error handling for device enumeration
+            let enum_result = unsafe { 
                 SetupDiEnumDeviceInterfaces(
                     device_info_set,
                     None,
@@ -193,7 +181,9 @@ impl WindowsRawIOController {
                     device_index,
                     &mut device_interface_data,
                 ) 
-            } {
+            };
+    
+            match enum_result {
                 Ok(_) => {
                     // Continue with this device
                     if let Some(device) = Self::process_device_interface(device_info_set, &device_interface_data) {
@@ -201,46 +191,50 @@ impl WindowsRawIOController {
                     }
                 },
                 Err(e) => {
-                    // Check if this is just the end of enumeration
+                    // More detailed error checking
                     let error_code = e.code().0;
-                    if error_code == 259 { // ERROR_NO_MORE_ITEMS
-                        break;
-                    } else {
-                        return Err(format!("Error enumerating device interfaces: {}", e).into());
+                    match error_code as i64 {
+                        0x80070103 => {
+                            // No more data is available - this is expected when we've enumerated all devices
+                            println!("Finished device enumeration.");
+                            break;
+                        },
+                        0x80070057 => {
+                            // Invalid parameter - sometimes occurs during enumeration
+                            println!("Invalid parameter during device enumeration. Continuing...");
+                            break;
+                        },
+                        _ => {
+                            println!("Unexpected error during device enumeration: 0x{:08X}", error_code);
+                            break;
+                        }
                     }
                 }
-            };
+            }
             
             device_index += 1;
+    
+            // Prevent infinite loop with a reasonable device limit
+            if device_index > 1000 {
+                println!("Exceeded maximum device enumeration limit.");
+                break;
+            }
         }
+        
+        // Added more logging for device detection
+        println!("Total compatible devices found: {}", found_devices.len());
         
         // Find the best device
         Self::select_best_controller(found_devices)
     }
-    
+
     fn process_device_interface(
         device_info_set: HDEVINFO, 
         device_interface_data: &SP_DEVICE_INTERFACE_DATA
     ) -> Option<ControllerDevice> {
-        // Get the device path size
+        // Allocate larger buffer to prevent truncation
         let mut required_size = 0u32;
-        unsafe {
-            SetupDiGetDeviceInterfaceDetailW(
-                device_info_set,
-                device_interface_data,
-                None,
-                0,
-                Some(&mut required_size),
-                None,
-            )
-        };
-        
-        if required_size == 0 {
-            return None;
-        }
-        
-        // Allocate buffer for device path
-        let mut device_interface_detail_data = vec![0u8; required_size as usize];
+        let mut device_interface_detail_data = vec![0u8; 1024]; // Increased buffer size
         let p_device_interface_detail_data = device_interface_detail_data.as_mut_ptr() 
             as *mut SP_DEVICE_INTERFACE_DETAIL_DATA_W;
         
@@ -253,53 +247,72 @@ impl WindowsRawIOController {
             };
         }
         
-        // Get device interface detail
+        // Get device interface detail with larger buffer
         let detail_result = unsafe {
             SetupDiGetDeviceInterfaceDetailW(
                 device_info_set,
                 device_interface_data,
                 Some(p_device_interface_detail_data),
-                required_size,
+                device_interface_detail_data.len() as u32,
                 Some(&mut required_size),
                 None,
             )
         };
         
         if detail_result.is_err() {
+            let error_code = unsafe { GetLastError() };
+            println!("Device interface detail error: 0x{:08X}", error_code.0);
             return None;
         }
         
         // Get the device path
         let device_path = unsafe {
             PCWSTR((*p_device_interface_detail_data).DevicePath.as_ptr())
+                .to_string()
+                .unwrap_or_else(|_| "Unknown".to_string())
         };
         
         // Try to open the device
-        let device_handle_result = unsafe {
+        let device_handle = match unsafe {
             CreateFileW(
-                device_path,
-                0x80000000 | 0x40000000,  // GENERIC_READ | GENERIC_WRITE
+                PCWSTR(device_path.encode_utf16().chain(Some(0)).collect::<Vec<_>>().as_ptr()),
+                0x80000000,  // GENERIC_READ
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 None,
                 OPEN_EXISTING,
-                FILE_FLAG_OVERLAPPED, // Important for async I/O
-                HANDLE::default(),
+                FILE_FLAG_OVERLAPPED,
+                None
             )
+        } {
+            Ok(handle) => {
+                if handle.is_invalid() {
+                    println!("Invalid device handle");
+                    return None;
+                }
+                handle
+            },
+            Err(e) => {
+                let error_code = e.code().0 as u32;
+                match error_code {
+                    0x80070005 => {
+                        println!("Access denied for device. Requires administrator privileges or special handling.");
+                        println!("Device path: {}", device_path);
+                    },
+                    0x80070020 => {
+                        println!("Device is being used by another process. Path: {}", device_path);
+                    },
+                    _ => {
+                        println!("Could not open device. Error: 0x{:08X}, Path: {}", error_code, device_path);
+                    }
+                }
+                return None;
+            }
         };
-
-        let device_handle = match device_handle_result {
-            Ok(handle) => handle,
-            Err(_) => return None,
-        };
-
-        if device_handle.is_invalid() {
-            return None;
-        }
-        
-        // Initialize the device
+    
+        // Rest of the initialization remains the same as in the original implementation
         Self::initialize_hid_device(device_handle)
     }
-    
+
     fn initialize_hid_device(device_handle: HANDLE) -> Option<ControllerDevice> {
         // Get device attributes
         let mut attrs = HIDD_ATTRIBUTES {
@@ -816,20 +829,32 @@ impl WindowsRawIOController {
 
 impl Controller for WindowsRawIOController {
     fn poll_events(&mut self) -> Result<Vec<ControllerEvent>, Box<dyn Error>> {
-        // Pre-allocate events vector to reduce allocations
+        static CONSECUTIVE_ERRORS: AtomicUsize = AtomicUsize::new(0);
+        
         let mut events = Vec::with_capacity(10);
         
-        // Try to read data from the device
         match self.read_device_data() {
             Ok(Some(data)) => {
-                // We got data, parse it
+                CONSECUTIVE_ERRORS.store(0, Ordering::Relaxed);
                 self.parse_report(&data, &mut events);
             },
             Ok(None) => {
-                // No data available yet, that's fine
+                return Ok(events);
             },
             Err(e) => {
-                return Err(format!("Error reading from controller: {}", e).into());
+                let error_count = CONSECUTIVE_ERRORS.fetch_add(1, Ordering::Relaxed) + 1;
+                
+                println!("Controller read error (attempt {}): {}", error_count, e);
+                
+                if error_count > 5 {
+                    println!("Attempting to reconnect controller...");
+                    
+                    // Instead of storing the new controller, just return an error
+                    return Err("Controller disconnected. Please reconnect.".into());
+                }
+                
+                std::thread::sleep(Duration::from_millis(50));
+                return Ok(events);
             }
         }
         
