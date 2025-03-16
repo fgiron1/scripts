@@ -10,7 +10,9 @@ fn main() {
         println!("cargo:rerun-if-changed={}", manifest_path.display());
 
         let mut res = winres::WindowsResource::new();
-        res.set_manifest_file(&manifest_path.to_string_lossy());
+        // Convert to string and then use as_str() to get a &str
+        let manifest_path_str = manifest_path.to_string_lossy().to_string();
+        res.set_manifest_file(&manifest_path_str);
         res.compile().unwrap();
     }
 }
