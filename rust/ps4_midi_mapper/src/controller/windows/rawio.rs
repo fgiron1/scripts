@@ -848,6 +848,3 @@ impl Controller for WindowsRawIOController {
         self
     }
 }
-
-// Make ControllerDevice implement Send by wrapping pointers
-// Add this impl to make your ControllerDevice thread-safe

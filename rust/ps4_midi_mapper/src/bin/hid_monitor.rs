@@ -1,376 +1,383 @@
-use hidapi::{HidApi, HidDevice};
 use std::io::{self, Write};
-use std::thread;
-use std::time::Duration;
 use std::error::Error;
+use std::mem::size_of;
+use std::time::Duration;
+use std::thread;
+
+use windows::core::PCWSTR;
+use windows::Win32::Devices::DeviceAndDriverInstallation::{
+    SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInterfaces,
+    SetupDiGetClassDevsW, SetupDiGetDeviceInterfaceDetailW, DIGCF_DEVICEINTERFACE, DIGCF_PRESENT,
+    HDEVINFO, SP_DEVICE_INTERFACE_DATA, SP_DEVICE_INTERFACE_DETAIL_DATA_W
+};
+use windows::Win32::Devices::HumanInterfaceDevice::{
+    HidD_GetHidGuid, HidD_GetProductString, HidD_GetManufacturerString,
+    HidD_GetAttributes, HIDD_ATTRIBUTES, 
+    HidD_GetPreparsedData, HidD_FreePreparsedData,
+    HidP_GetCaps, HIDP_CAPS, PHIDP_PREPARSED_DATA
+};
+use windows::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, 
+    ReadFile
+};
+use windows::Win32::Foundation::{
+    HANDLE, GENERIC_READ, GENERIC_WRITE, 
+    FALSE, GetLastError, NTSTATUS
+};
 
 // Constants for display
 const RESET: &str = "\x1B[0m";
 const YELLOW: &str = "\x1B[33m";
 const GREEN: &str = "\x1B[32m";
 const CYAN: &str = "\x1B[36m";
-const CLEAR_LINE: &str = "\x1B[2K\r";
-const CURSOR_UP: &str = "\x1B[1A";
+
+// Constants for monitoring
+const MONITOR_TIMEOUT_MS: u32 = 10;
 
 /// Main function
 fn main() -> Result<(), Box<dyn Error>> {
-    println!("\n{}===== Simple HID Device Monitor ====={}",
+    println!("\n{}===== Windows HID Device Monitoring Tool ====={}",
              GREEN, RESET);
-    println!("This tool helps identify and monitor HID devices");
+    println!("This tool helps inspect low-level HID device data");
     
-    // Create HidApi instance
-    let api = HidApi::new()?;
+    // Get available devices
+    let devices = enumerate_hid_devices()?;
     
-    // List all devices with detailed info
-    println!("\nAll detected HID devices:");
-    println!("{:<4} {:<6} {:<6} {:<24} {:<10} {:<10} {:<8}", 
-             "Idx", "VID", "PID", "Product", "UsagePage", "Usage", "Interface");
-    println!("{:-<75}", "");
-
-    let devices: Vec<_> = api.device_list().collect();
-    if devices.is_empty() {
-        println!("No HID devices detected!");
-        return Err("No devices found".into());
-    }
-
-    for (i, device_info) in devices.iter().enumerate() {
-        let product = device_info.product_string().unwrap_or("Unknown");
-        println!("{:<4} {:<6} {:<6} {:<24} {:<10} {:<10} {:<8}", 
-                 i, 
-                 format!("{:04x}", device_info.vendor_id()),
-                 format!("{:04x}", device_info.product_id()),
-                 product,
-                 format!("0x{:04X}", device_info.usage_page()),
-                 format!("0x{:04X}", device_info.usage()),
-                 device_info.interface_number());
+    // Display devices
+    println!("\nAvailable HID Devices:");
+    for (i, device) in devices.iter().enumerate() {
+        println!("{}: {} (VID: 0x{:04X}, PID: 0x{:04X})", 
+                 i, device.product, device.vid, device.pid);
     }
     
-    // Offer to list all PS4 controller related devices first
-    println!("\nPotential touchpad or controller devices:");
-    println!("{:-<75}", "");
-    
-    let ps4_devices: Vec<_> = devices.iter().enumerate()
-        .filter(|(_, d)| {
-            let product = d.product_string().unwrap_or("").to_lowercase();
-            let is_sony = d.vendor_id() == 0x054C; // Sony VID
-            let is_touchpad = product.contains("touch") || 
-                             (d.usage_page() == 0x000D) || // Digitizer
-                             (product.contains("pad") && !product.contains("gamepad"));
-            let is_controller = product.contains("controller") || 
-                               product.contains("dualshock") ||
-                               product.contains("wireless");
-            
-            is_sony || is_touchpad || is_controller
-        })
-        .collect();
-    
-    if ps4_devices.is_empty() {
-        println!("No PS4 controller or touchpad-like devices found.");
-    } else {
-        for (idx, (i, device_info)) in ps4_devices.iter().enumerate() {
-            let product = device_info.product_string().unwrap_or("Unknown");
-            println!("{:<4} {:<6} {:<6} {:<24} {:<10} {:<10} {:<8}", 
-                     idx, 
-                     format!("{:04x}", device_info.vendor_id()),
-                     format!("{:04x}", device_info.product_id()),
-                     product,
-                     format!("0x{:04X}", device_info.usage_page()),
-                     format!("0x{:04X}", device_info.usage()),
-                     device_info.interface_number());
-        }
-    }
-    
-    // Get user selection
-    print!("\nEnter device index to monitor (from the complete list, or 'q' to quit): ");
+    // Select device
+    print!("\nEnter device index to monitor: ");
     io::stdout().flush()?;
     
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
     
-    let input = input.trim();
-    if input.eq_ignore_ascii_case("q") {
-        return Ok(());
-    }
+    let device_index = input.trim().parse::<usize>()?;
+    let selected_device = &devices[device_index];
     
-    let device_index = match input.parse::<usize>() {
-        Ok(idx) if idx < devices.len() => idx,
-        _ => {
-            println!("Invalid selection!");
-            return Err("Invalid selection".into());
-        }
+    // Monitor selected device
+    monitor_device(selected_device)?;
+    
+    Ok(())
+}
+
+/// Device information structure
+#[derive(Debug)]
+struct DeviceInfo {
+    vid: u16,
+    pid: u16,
+    product: String,
+    manufacturer: String,
+    device_path: String,
+}
+
+/// Enumerate HID devices
+fn enumerate_hid_devices() -> Result<Vec<DeviceInfo>, Box<dyn Error>> {
+    let hid_guid = unsafe { HidD_GetHidGuid() };
+    
+    let device_info_set = unsafe {
+        SetupDiGetClassDevsW(
+            Some(&hid_guid),
+            PCWSTR::null(),
+            None,
+            DIGCF_DEVICEINTERFACE | DIGCF_PRESENT
+        )?
     };
     
-    // Get the selected device info
-    let device_info = &devices[device_index];
-    println!("\nSelected device: {} (VID: 0x{:04X}, PID: 0x{:04X})", 
-             device_info.product_string().unwrap_or("Unknown"), 
-             device_info.vendor_id(), 
-             device_info.product_id());
+    let mut devices = Vec::new();
+    let mut device_interface_data = SP_DEVICE_INTERFACE_DATA {
+        cbSize: size_of::<SP_DEVICE_INTERFACE_DATA>() as u32,
+        ..Default::default()
+    };
     
-    // Try the direct approach first (might fail for some devices)
-    println!("Attempting to monitor device...");
-    if let Err(e) = monitor_device(device_info, &api) {
-        println!("Failed to access device: {}", e);
-        #[cfg(target_os = "windows")]
-        println!("This is normal for some devices on Windows, especially touchpads which may be locked by the system.");
-        println!("\nAdvice for DualShock touchpad access:");
-        println!("1. Try DS4Windows or similar driver that exposes touchpad data");
-        println!("2. Consider using lower-level access methods in your main application");
-        println!("3. For development, try adding touchpad support to your app conditionally");
-    }
+    let mut device_index = 0;
     
-    Ok(())
-}
-
-/// Monitor data from a specific device
-fn monitor_device(device_info: &hidapi::DeviceInfo, api: &HidApi) -> Result<(), Box<dyn Error>> {
-    // Convert path to CString for hidapi
-    use std::ffi::CString;
-    let path_cstr = CString::new(device_info.path().to_string_lossy().to_string())?;
-    
-    // Open the device
-    let device = api.open_path(path_cstr.as_ref())?;
-    println!("✓ Successfully opened device!");
-    
-    // Set device to non-blocking mode
-    if let Err(e) = device.set_blocking_mode(false) {
-        println!("Warning: Could not set non-blocking mode: {}", e);
-    }
-    
-    // Prepare display
-    println!("\n{}===== HID Data Monitor ====={}",
-             GREEN, RESET);
-    println!("Interact with the device to see data changes");
-    println!("Press Ctrl+C to exit\n");
-    
-    // Prepare display area with blank lines to create a static view
-    for _ in 0..25 {
-        println!();
-    }
-    
-    // Move cursor back up
-    for _ in 0..25 {
-        print!("{}", CURSOR_UP);
-    }
-    io::stdout().flush()?;
-    
-    // Monitor loop
-    monitor_loop(&device)?;
-    
-    Ok(())
-}
-
-/// Main monitoring loop for device data
-fn monitor_loop(device: &HidDevice) -> Result<(), Box<dyn Error>> {
-    let mut last_data = Vec::new();
-    let mut report_counter = 0;
-    let mut change_counter = 0;
-    let mut buf = [0u8; 64]; // 64 bytes is common for HID reports
-    
-    while report_counter < 1000 { // Limit to avoid infinite loop
-        match device.read_timeout(&mut buf, 5) {
-            Ok(size) if size > 0 => {
-                let data = &buf[..size];
-                report_counter += 1;
-                
-                // Check if data changed
-                if data != last_data.as_slice() {
-                    change_counter += 1;
-                    update_display(data, &last_data, report_counter, change_counter)?;
-                    last_data = data.to_vec();
-                }
-            },
+    loop {
+        match unsafe { 
+            SetupDiEnumDeviceInterfaces(
+                device_info_set,
+                None,
+                &hid_guid,
+                device_index,
+                &mut device_interface_data,
+            ) 
+        } {
             Ok(_) => {
-                // No data, just wait
-                thread::sleep(Duration::from_millis(5));
-            },
-            Err(e) => {
-                // Only report non-timeout errors
-                if !e.to_string().contains("timed out") && 
-                   !e.to_string().contains("no data available") {
-                    // Clear line and print error
-                    print!("{}", CLEAR_LINE);
-                    println!("Error reading device: {}", e);
-                    thread::sleep(Duration::from_secs(1));
-                    return Err(e.into());
+                let device_path = get_device_path(device_info_set, &device_interface_data)?;
+                
+                if let Some(device_info) = get_device_details(&device_path) {
+                    devices.push(device_info);
                 }
-                thread::sleep(Duration::from_millis(5));
-            }
+            },
+            Err(_) => break,
         }
+        
+        device_index += 1;
     }
     
-    Ok(())
+    unsafe { SetupDiDestroyDeviceInfoList(device_info_set); }
+    
+    Ok(devices)
 }
 
-/// Update the display with current data
-fn update_display(data: &[u8], last_data: &[u8], reports: u32, changes: u32) -> Result<(), Box<dyn Error>> {
-    // Header section
-    print!("{}", CLEAR_LINE);
-    println!("{}HID Report Monitor{}", CYAN, RESET);
-    print!("{}", CLEAR_LINE);
-    println!("Reports: {}, Changes: {}, Report Size: {} bytes", reports, changes, data.len());
+/// Get device path
+fn get_device_path(
+    device_info_set: HDEVINFO, 
+    device_interface_data: &SP_DEVICE_INTERFACE_DATA
+) -> Result<String, Box<dyn Error>> {
+    let mut required_size = 0u32;
     
-    // Raw data section
-    print!("{}", CLEAR_LINE);
-    println!("{}Raw Data:{}", CYAN, RESET);
+    unsafe {
+        SetupDiGetDeviceInterfaceDetailW(
+            device_info_set,
+            device_interface_data,
+            None,
+            0,
+            Some(&mut required_size),
+            None,
+        )
+    };
     
-    // Header row for byte indices
-    print!("{}", CLEAR_LINE);
-    print!("     ");
-    for i in 0..16 {
-        print!("{:02X} ", i);
+    let mut device_interface_detail_data = vec![0u8; required_size as usize];
+    let p_detail_data = device_interface_detail_data.as_mut_ptr() 
+        as *mut SP_DEVICE_INTERFACE_DETAIL_DATA_W;
+    
+    unsafe {
+        (*p_detail_data).cbSize = if cfg!(target_pointer_width = "64") { 8 } else { 6 };
     }
-    println!();
     
-    // Horizontal line
-    print!("{}", CLEAR_LINE);
-    print!("    +");
-    for _ in 0..16 {
-        print!("---");
+    unsafe {
+        SetupDiGetDeviceInterfaceDetailW(
+            device_info_set,
+            device_interface_data,
+            Some(p_detail_data),
+            required_size,
+            Some(&mut required_size),
+            None,
+        )?
+    };
+    
+    let device_path = unsafe {
+        PCWSTR((*p_detail_data).DevicePath.as_ptr())
+            .to_string()
+            .unwrap_or_else(|_| "Unknown".to_string())
+    };
+    
+    Ok(device_path)
+}
+
+/// Get device details
+fn get_device_details(device_path: &str) -> Option<DeviceInfo> {
+    let path_wide: Vec<u16> = device_path.encode_utf16().chain(Some(0)).collect();
+    
+    let device_handle = match unsafe {
+        CreateFileW(
+            PCWSTR(path_wide.as_ptr()),
+            GENERIC_READ.0 | GENERIC_WRITE.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            Default::default(),
+            None
+        )
+    } {
+        Ok(handle) => handle,
+        Err(_) => return None,
+    };
+    
+    let mut attrs = HIDD_ATTRIBUTES {
+        Size: size_of::<HIDD_ATTRIBUTES>() as u32,
+        ..Default::default()
+    };
+    
+    let get_attrs_result = unsafe { 
+        HidD_GetAttributes(device_handle, &mut attrs) 
+    };
+    
+    if i32::from(get_attrs_result.0) == FALSE.0 {
+        unsafe { let _ = windows::Win32::Foundation::CloseHandle(device_handle); }
+        return None;
     }
-    println!("+");
     
-    // Data rows
-    for row in 0..((data.len() + 15) / 16) {
-        print!("{}", CLEAR_LINE);
-        print!("{:02X} | ", row * 16);
+    let product = get_hid_string(&device_handle, HidStringType::Product)
+        .unwrap_or_else(|_| "Unknown".to_string());
+    
+    let manufacturer = get_hid_string(&device_handle, HidStringType::Manufacturer)
+        .unwrap_or_else(|_| "Unknown".to_string());
+    
+    unsafe { 
+        let _ = windows::Win32::Foundation::CloseHandle(device_handle); 
+    }
+    
+    Some(DeviceInfo {
+        vid: attrs.VendorID,
+        pid: attrs.ProductID,
+        product,
+        manufacturer,
+        device_path: device_path.to_string(),
+    })
+}
+
+/// Enum to specify which string to retrieve from HID device
+enum HidStringType {
+    Product,
+    Manufacturer,
+}
+
+/// Get string from HID device
+fn get_hid_string(
+    device_handle: &HANDLE, 
+    string_type: HidStringType
+) -> Result<String, Box<dyn Error>> {
+    let mut buffer = [0u16; 256];
+    
+    let result = match string_type {
+        HidStringType::Product => unsafe {
+            HidD_GetProductString(
+                *device_handle, 
+                buffer.as_mut_ptr() as _, 
+                (buffer.len() * size_of::<u16>()) as u32
+            )
+        },
+        HidStringType::Manufacturer => unsafe {
+            HidD_GetManufacturerString(
+                *device_handle, 
+                buffer.as_mut_ptr() as _, 
+                (buffer.len() * size_of::<u16>()) as u32
+            )
+        },
+    };
+    
+    if i32::from(result.0) == FALSE.0 {
+        return Err("Could not retrieve device string".into());
+    }
+    
+    let len = buffer.iter().position(|&x| x == 0).unwrap_or(buffer.len());
+    Ok(String::from_utf16_lossy(&buffer[..len]))
+}
+
+/// Monitor a specific device
+fn monitor_device(device: &DeviceInfo) -> Result<(), Box<dyn Error>> {
+    println!("\n{}===== Monitoring Device: {} ====={}",
+             GREEN, device.product, RESET);
+    println!("VID: 0x{:04X}, PID: 0x{:04X}", device.vid, device.pid);
+    println!("Path: {}", device.device_path);
+    
+    // Convert path to wide string
+    let path_wide: Vec<u16> = device.device_path.encode_utf16().chain(Some(0)).collect();
+    
+    // Open device
+    let device_handle = unsafe {
+        CreateFileW(
+            PCWSTR(path_wide.as_ptr()),
+            GENERIC_READ.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            Default::default(),
+            None
+        )?
+    };
+    
+    // Get preparsed data to determine report size
+    let mut preparsed_data = PHIDP_PREPARSED_DATA::default();
+    let preparsed_result = unsafe { 
+        HidD_GetPreparsedData(device_handle, &mut preparsed_data) 
+    };
+    if i32::from(preparsed_result.0) == FALSE.0 {
+        unsafe { let _ = windows::Win32::Foundation::CloseHandle(device_handle); }
+        return Err("Could not get preparsed data".into());
+    }
+    
+    // Get device capabilities
+    let mut caps = HIDP_CAPS::default();
+    let caps_result = unsafe { 
+        HidP_GetCaps(preparsed_data, &mut caps) 
+    };
+    
+    if caps_result != NTSTATUS(0) {  // Non-zero indicates an error
+        unsafe { 
+            let _ = HidD_FreePreparsedData(preparsed_data);
+            let _ = windows::Win32::Foundation::CloseHandle(device_handle); 
+        }
+        return Err("Could not get device capabilities".into());
+    }
+    
+    println!("\nDevice Capabilities:");
+    println!("  Input Report Size: {} bytes", caps.InputReportByteLength);
+    println!("  Output Report Size: {} bytes", caps.OutputReportByteLength);
+    println!("  Feature Report Size: {} bytes", caps.FeatureReportByteLength);
+    
+    // Monitoring setup
+    println!("\n{}Press Ctrl+C to stop monitoring.{}", YELLOW, RESET);
+    
+    let mut report_buffer = vec![0u8; caps.InputReportByteLength as usize];
+    let mut report_counter = 0u32;
+    let mut change_counter = 0u32;
+    
+    // Monitoring loop
+    loop {
+        // Read report
+        let mut bytes_read = 0u32;
+        let read_result = unsafe {
+            ReadFile(
+                device_handle,
+                Some(&mut report_buffer),
+                Some(&mut bytes_read),
+                None
+            )
+        };
         
-        for col in 0..16 {
-            let idx = row * 16 + col;
-            if idx < data.len() {
-                // Check if byte changed
-                let changed = idx >= last_data.len() || data[idx] != last_data[idx];
-                
-                if changed {
-                    print!("{}{:02X}{} ", YELLOW, data[idx], RESET);
-                } else {
-                    print!("{:02X} ", data[idx]);
-                }
-            } else {
-                print!("   ");
+        // Check if read was successful and we read something
+        if read_result.is_ok() && bytes_read > 0 {
+            report_counter += 1;
+            
+            // Print raw data
+            println!("\n{}Report #{} (Size: {}):{}", 
+                     CYAN, report_counter, bytes_read, RESET);
+            
+            // Hex representation
+            print!("HEX : ");
+            for &byte in &report_buffer[..bytes_read as usize] {
+                print!("{:02X} ", byte);
+            }
+            println!();
+            
+            // ASCII representation
+            print!("ASCII: ");
+            for &byte in &report_buffer[..bytes_read as usize] {
+                let c = byte as char;
+                print!("{} ", if c.is_ascii_graphic() { c } else { '.' });
+            }
+            println!();
+            
+            // Change detection
+            if bytes_read as usize > 1 {
+                change_counter += 1;
+            }
+            
+            // Optional delay to prevent overwhelming output
+            thread::sleep(Duration::from_millis(MONITOR_TIMEOUT_MS as u64));
+        } else {
+            // Check for errors
+            let error = unsafe { GetLastError() };
+            if error.0 != 0 {
+                println!("Error reading device: {}", error.0);
+                break;
             }
         }
-        println!("|");
     }
     
-    // Horizontal line
-    print!("{}", CLEAR_LINE);
-    print!("    +");
-    for _ in 0..16 {
-        print!("---");
+    // Cleanup
+    unsafe { 
+        let _ = HidD_FreePreparsedData(preparsed_data);
+        let _ = windows::Win32::Foundation::CloseHandle(device_handle); 
     }
-    println!("+");
-    
-    // Add ASCII representation
-    print!("{}", CLEAR_LINE);
-    println!("{}ASCII:{}", CYAN, RESET);
-    
-    print!("{}", CLEAR_LINE);
-    print!("     ");
-    for i in 0..16 {
-        print!(" {:X} ", i);
-    }
-    println!();
-    
-    for row in 0..((data.len() + 15) / 16) {
-        print!("{}", CLEAR_LINE);
-        print!("{:02X} | ", row * 16);
-        
-        for col in 0..16 {
-            let idx = row * 16 + col;
-            if idx < data.len() {
-                let c = data[idx];
-                let changed = idx >= last_data.len() || data[idx] != last_data[idx];
-                
-                if c >= 32 && c <= 126 {
-                    // Printable ASCII
-                    if changed {
-                        print!("{}{}{}  ", YELLOW, c as char, RESET);
-                    } else {
-                        print!("{}  ", c as char);
-                    }
-                } else {
-                    // Non-printable
-                    if changed {
-                        print!("{}·{}  ", YELLOW, RESET);
-                    } else {
-                        print!("·  ");
-                    }
-                }
-            } else {
-                print!("   ");
-            }
-        }
-        println!("|");
-    }
-    
-    // Pattern detection section
-    print!("{}", CLEAR_LINE);
-    println!("{}Pattern Detection:{}", CYAN, RESET);
-    
-    // Try to detect touchpad coordinates (common ranges for PS4 touchpad)
-    let mut found_coords = false;
-    for i in 0..data.len().saturating_sub(4) {
-        // Look for potential 16-bit coordinates (little-endian)
-        let x = (data[i] as u16) | ((data[i + 1] as u16) << 8);
-        let y = (data[i + 2] as u16) | ((data[i + 3] as u16) << 8);
-        
-        // PS4 touchpad is typically 1920×942, but check for reasonable ranges
-        if (x > 0 && x < 2000 && y > 0 && y < 1000) {
-            print!("{}", CLEAR_LINE);
-            println!("Potential touchpad coordinates at offset {}: X={}, Y={}", i, x, y);
-            found_coords = true;
-            
-            // Show how these values changed
-            if i < last_data.len().saturating_sub(4) {
-                let last_x = (last_data[i] as u16) | ((last_data[i + 1] as u16) << 8);
-                let last_y = (last_data[i + 2] as u16) | ((last_data[i + 3] as u16) << 8);
-                
-                if x != last_x || y != last_y {
-                    print!("{}", CLEAR_LINE);
-                    println!("  Change: ΔX={}, ΔY={}", 
-                             (x as i32) - (last_x as i32), 
-                             (y as i32) - (last_y as i32));
-                }
-            }
-            
-            // Implementation hint
-            print!("{}", CLEAR_LINE);
-            println!("  Implementation: self.touchpad_format = TouchpadFormat::HIDTouchpad1 {{");
-            print!("{}", CLEAR_LINE);
-            println!("    x_offset: {},", i);
-            print!("{}", CLEAR_LINE);
-            println!("    y_offset: {},", i + 2);
-            print!("{}", CLEAR_LINE);
-            println!("    touch_byte: 0,  // Try different values");
-            print!("{}", CLEAR_LINE);
-            println!("    touch_mask: 0x01");
-            print!("{}", CLEAR_LINE);
-            println!("  }};");
-            
-            break;
-        }
-    }
-    
-    if !found_coords {
-        print!("{}", CLEAR_LINE);
-        println!("No potential touchpad coordinates detected yet.");
-        print!("{}", CLEAR_LINE);
-        println!("Try moving your finger on the touchpad.");
-    }
-    
-    // Fill remaining lines to maintain stable display area
-    let used_lines = 17 + (data.len() + 15) / 16 * 2 + (if found_coords { 8 } else { 2 });
-    for _ in used_lines..25 {
-        print!("{}", CLEAR_LINE);
-        println!();
-    }
-    
-    // Move cursor back up
-    for _ in 0..25 {
-        print!("{}", CURSOR_UP);
-    }
-    io::stdout().flush()?;
     
     Ok(())
 }
