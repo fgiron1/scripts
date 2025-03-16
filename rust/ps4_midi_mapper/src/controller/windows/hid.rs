@@ -2,6 +2,7 @@ use hidapi::{HidApi, HidDevice};
 use std::error::Error;
 use std::collections::HashMap;
 use std::any::Any;
+
 use crate::controller::{Controller, types::{ControllerEvent, Button, Axis, DeviceInfo}};
 use crate::controller::profiles::{ControllerProfile, get_profile_for_device, create_profiles, ConnectionType, detect_connection_type};
 
@@ -10,6 +11,44 @@ const DS4_TOUCHPAD_X_MAX: i32 = 1920;
 const DS4_TOUCHPAD_Y_MAX: i32 = 942;
 const DEFAULT_STICK_DEADZONE: f32 = 0.10;
 const DEFAULT_TRIGGER_DEADZONE: f32 = 0.05;
+
+const TOUCHPAD_USAGE_PAGES: &[u16] = &[
+    0x0D,  // Digitizer Page
+    0x04,  // Game Controls
+    0x01,  // Generic Desktop
+];
+
+const TOUCHPAD_USAGES: &[u16] = &[
+    0x05,  // Touch Pad
+    0x22,  // Finger
+    0x04,  // Joystick
+    0x08,  // Multi-axis Controller
+];
+
+#[derive(Debug, PartialEq, Clone)]
+enum TouchpadCapability {
+    MultiTouch,
+    XYCoordinates,
+    ContactIdentifier,
+}
+
+struct TouchpadDetectionConfig {
+    min_absolute_axes: usize,
+    required_capabilities: &'static [TouchpadCapability],
+}
+
+impl TouchpadDetectionConfig {
+    fn ds4_touchpad() -> Self {
+        Self {
+            min_absolute_axes: 2,
+            required_capabilities: &[
+                TouchpadCapability::XYCoordinates,
+                TouchpadCapability::MultiTouch,
+                TouchpadCapability::ContactIdentifier,
+            ],
+        }
+    }
+}
 
 pub struct HidController {
     device: HidDevice,
@@ -133,8 +172,7 @@ impl HidController {
                           product_lower.contains("wireless controller");
         
         // Always look for the separate touchpad device, regardless of controller type
-        let touchpad_device = Self::find_touchpad_device(&api, &device_info)?;
-        
+        let touchpad_device = HidController::find_touchpad_device(&api)?;        
         if touchpad_device.is_some() {
             println!("✅ Found separate HID-compliant touchpad device!");
         } else {
@@ -263,120 +301,41 @@ impl HidController {
     }
     
     // Enhanced touchpad device detection for Windows systems
-    fn find_touchpad_device(api: &HidApi, controller_info: &DeviceInfo) -> Result<Option<HidDevice>, Box<dyn Error>> {
-        println!("🔍 Searching for HID-compliant touchpad device...");
+    fn find_touchpad_device(api: &HidApi) -> Result<Option<HidDevice>, Box<dyn Error>> {
+        println!("🔍 Advanced Touchpad Detection for Windows HID");
         
-        // For Sony controllers, try to find a matching touchpad device
-        if controller_info.vid == 0x054C {
-            // Look for devices with similar path but different interface
-            for device_info in api.device_list() {
-                // Skip if not from Sony
-                if device_info.vendor_id() != 0x054C {
-                    continue;
-                }
-                
-                if let Some(product) = device_info.product_string() {
-                    let product_lower = product.to_lowercase();
-                    
-                    // Strong check for touchpad devices
-                    if product_lower == "hid-compliant touchpad" || 
-                       product_lower.contains("touchpad") {
-                        println!("🎯 Found touchpad device: {}", product);
-                        println!("   VID: 0x{:04X}, PID: 0x{:04X}", 
-                                 device_info.vendor_id(), device_info.product_id());
-                        
-                        // Try to open the device
-                        match api.open_path(device_info.path()) {
-                            Ok(device) => {
-                                println!("✅ Successfully opened touchpad device!");
-                                
-                                // Set to non-blocking mode with more aggressive settings
-                                let _ = device.set_blocking_mode(false);
-                                
-                                return Ok(Some(device));
-                            },
-                            Err(e) => {
-                                println!("⚠️ Failed to open device: {}", e);
-                                // Continue to try other devices
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        
-        // General touchpad detection
-        for device_info in api.device_list() {
-            if let Some(product) = device_info.product_string() {
-                let product_lower = product.to_lowercase();
-                
-                // Strong check for touchpad devices
-                if product_lower == "hid-compliant touchpad" || 
-                   product_lower.contains("touchpad") {
-                    println!("🎯 Found touchpad device: {}", product);
-                    println!("   VID: 0x{:04X}, PID: 0x{:04X}", 
-                             device_info.vendor_id(), device_info.product_id());
-                    
-                    // Try to open the device
-                    match api.open_path(device_info.path()) {
-                        Ok(device) => {
-                            println!("✅ Successfully opened touchpad device!");
-                            
-                            // Set to non-blocking mode with more aggressive settings
-                            let _ = device.set_blocking_mode(false);
-                            
-                            return Ok(Some(device));
-                        },
-                        Err(e) => {
-                            println!("⚠️ Failed to open device: {}", e);
-                            // Continue to try other devices
-                        }
-                    }
-                }
-            }
-        }
-        
-        // Check for touchpad usage pages
-        for device_info in api.device_list() {
-            // Check for touchpad usage pages and usages (broader range)
-            let is_touchpad_by_usage = 
-                device_info.usage_page() == 0x0D || // Digitizer
-                device_info.usage_page() == 0x04 || // Touch screen
-                device_info.usage_page() == 0x0B || // Haptic page (sometimes used)
-                (device_info.usage_page() == 0x01 && // Generic Desktop
-                    (device_info.usage() == 0x04 || // Joystick (sometimes touchpads register as this)
-                     device_info.usage() == 0x08)); // Multi-axis Controller
+        for device_info_raw in api.device_list() {
+            // Prepare device info for detection
+            let product = device_info_raw.product_string()
+                .unwrap_or_else(|| "Unknown");
+            let manufacturer = device_info_raw.manufacturer_string()
+                .unwrap_or_else(|| "Unknown");
             
-            if is_touchpad_by_usage {
-                if let Some(product) = device_info.product_string() {
-                    // Filter out main controller devices to avoid duplication
-                    let product_lower = product.to_lowercase();
-                    let is_likely_controller =
-                        product_lower.contains("controller") ||
-                        product_lower.contains("gamepad");
-                    
-                    // Skip if it's likely the main controller
-                    if is_likely_controller {
-                        continue;
-                    }
-                    
-                    println!("🔍 Potential touchpad by usage: {}", product);
-                    println!("   VID: 0x{:04X}, PID: 0x{:04X}", 
-                             device_info.vendor_id(), device_info.product_id());
-                    println!("   Usage Page: 0x{:04X}, Usage: 0x{:04X}",
-                             device_info.usage_page(), device_info.usage());
-                    
-                    // Try to open the device
-                    if let Ok(device) = api.open_path(device_info.path()) {
-                        println!("✅ Opened potential touchpad device");
-                        let _ = device.set_blocking_mode(false);
+            let device_info = DeviceInfo {
+                vid: device_info_raw.vendor_id(),
+                pid: device_info_raw.product_id(),
+                manufacturer: manufacturer.to_string(),
+                product: product.to_string(),
+            };
+            
+            // Detect if this is a potential touchpad
+            if let Some(_) = Self::advanced_touchpad_detection(&device_info, device_info_raw) {
+                Self::print_device_details(device_info_raw);
+                
+                // Try to open the device
+                match api.open_path(device_info_raw.path()) {
+                    Ok(device) => {
+                        println!("✅ Found potential touchpad device: {}", device_info.product);
                         return Ok(Some(device));
+                    },
+                    Err(e) => {
+                        println!("⚠️ Could not open device: {}", e);
                     }
                 }
             }
         }
         
-        println!("❌ No separate touchpad device found. Will try to extract touchpad data from main controller reports.");
+        println!("❌ No touchpad device found with advanced detection");
         Ok(None)
     }
 
@@ -991,6 +950,40 @@ impl HidController {
             self.axis_values.insert(axis, value);
         }
     }
+
+    fn advanced_touchpad_detection(
+        device_info: &DeviceInfo, 
+        device: &hidapi::DeviceInfo
+    ) -> Option<TouchpadCapability> {
+        let mut detected_capabilities: Vec<TouchpadCapability> = Vec::new();
+
+        // Check usage pages and usages
+        let is_touchpad_usage = 
+            TOUCHPAD_USAGE_PAGES.contains(&device.usage_page()) &&
+            TOUCHPAD_USAGES.contains(&device.usage());
+
+        // Check product name hints
+        let name_lower = device.product_string()
+            .unwrap_or_default()
+            .to_lowercase();
+        let is_name_hint = 
+            name_lower.contains("touchpad") || 
+            name_lower.contains("touch") || 
+            name_lower.contains("sensor");
+
+        // Check VID/PID known touchpad devices
+        let is_known_device = 
+            (device_info.vid == 0x054C && // Sony
+                (device_info.pid == 0x05C4 || // DS4 v1
+                 device_info.pid == 0x09CC || // DS4 v2
+                 device_info.pid == 0x0CE6 || // DualSense
+                 device_info.pid == 0x0DF2))  // DualSense BT
+            || is_name_hint
+            || is_touchpad_usage;
+
+        // If it's a known device or matches name/usage, consider it a potential touchpad
+        is_known_device.then_some(TouchpadCapability::MultiTouch)
+    }
     
     // Helper to update touchpad position and generate events
     fn update_touchpad_position(&mut self, x: i32, y: i32, events: &mut Vec<ControllerEvent>) {
@@ -1035,6 +1028,15 @@ impl HidController {
             }
         }
     }
+
+    fn print_device_details(device: &hidapi::DeviceInfo) {
+        println!("Potential Touchpad Device Details:");
+        println!("  Name: {}", device.product_string().unwrap_or("Unknown"));
+        println!("  Manufacturer: {}", device.manufacturer_string().unwrap_or("Unknown"));
+        println!("  VID: 0x{:04X}, PID: 0x{:04X}", device.vendor_id(), device.product_id());
+        println!("  Usage Page: 0x{:04X}", device.usage_page());
+        println!("  Usage: 0x{:04X}", device.usage());
+    } 
     
     // Helper to handle touch release
     fn end_touch(&mut self, events: &mut Vec<ControllerEvent>) {
@@ -1090,55 +1092,6 @@ impl HidController {
         ((normalized - DEFAULT_TRIGGER_DEADZONE) / (1.0 - DEFAULT_TRIGGER_DEADZONE)).min(1.0)
     }
     
-    // Print detailed debug information about the touchpad data format
-    pub fn print_touchpad_debug(&self) {
-        println!("\nTouchpad Debug Information:");
-        println!("-------------------------");
-        println!("Separate touchpad device present: {}", self.touchpad_device.is_some());
-        println!("Format detected: {}", self.touchpad_format_detected);
-        
-        match self.touchpad_format {
-            TouchpadFormat::HIDTouchpad1 { x_offset, y_offset, touch_byte, touch_mask } => {
-                println!("Format type: HID Touchpad Type 1");
-                println!("X offset: {}", x_offset);
-                println!("Y offset: {}", y_offset);
-                println!("Touch state byte: {} (mask: 0x{:02X})", touch_byte, touch_mask);
-            },
-            TouchpadFormat::HIDTouchpad2 { x_offset, y_offset, touch_byte, touch_mask } => {
-                println!("Format type: HID Touchpad Type 2");
-                println!("X offset: {}", x_offset);
-                println!("Y offset: {}", y_offset);
-                println!("Touch state byte: {} (mask: 0x{:02X})", touch_byte, touch_mask);
-            },
-            TouchpadFormat::Unknown => {
-                println!("Format type: Unknown (still detecting)");
-            }
-        }
-        
-        println!("Current tracking state: {}", self.touchpad_tracking);
-        println!("Last tracked position: ({}, {})", self.touchpad_last_x, self.touchpad_last_y);
-        println!("-------------------------");
-    }
-    
-    // Enable touchpad debugging
-    pub fn enable_touchpad_debug(&mut self) {
-        self.debug_mode = true;
-        println!("\n📱 TOUCHPAD DEBUGGING ENABLED");
-        println!("============================");
-        
-        // Force format to Unknown to trigger re-detection
-        self.touchpad_format = TouchpadFormat::Unknown;
-        self.touchpad_format_detected = false;
-        
-        // Print current state
-        println!("Is DualShock: {}", self.is_dualshock);
-        println!("Has separate touchpad device: {}", self.touchpad_device.is_some());
-        println!("Current tracking state: {}", self.touchpad_tracking);
-        println!("Bluetooth mode: {}", self.is_bluetooth);
-        println!("");
-        println!("HINT: Try swiping on the touchpad in different patterns");
-        println!("============================\n");
-    }
 }
 
 // Simple helper for min
