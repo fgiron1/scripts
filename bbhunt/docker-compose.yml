@@ -1,0 +1,92 @@
+CPU=2
+    depends_on:
+      - redis
+      - bbhunt-core
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+    restart: unless-stopped
+    networks:
+      - bbhunt-net
+
+  # Scanning workers - scalable
+  scan-worker:
+    image: bbhunt:latest
+    volumes:
+      - ./data:/app/data
+    environment:
+      - BBHUNT_MODE=worker
+      - BBHUNT_WORKER_TYPE=scan
+      - BBHUNT_REDIS_HOST=redis
+      - MAX_MEMORY=3G
+      - MAX_CPU=2
+    depends_on:
+      - redis
+      - bbhunt-core
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: '2'
+          memory: 3G
+    restart: unless-stopped
+    networks:
+      - bbhunt-net
+
+  # Exploitation workers - scalable
+  exploit-worker:
+    image: bbhunt:latest
+    volumes:
+      - ./data:/app/data
+    environment:
+      - BBHUNT_MODE=worker
+      - BBHUNT_WORKER_TYPE=exploit
+      - BBHUNT_REDIS_HOST=redis
+      - MAX_MEMORY=2G
+      - MAX_CPU=1
+    depends_on:
+      - redis
+      - bbhunt-core
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          cpus: '1'
+          memory: 2G
+    restart: unless-stopped
+    networks:
+      - bbhunt-net
+
+  # Reporting workers - scalable
+  report-worker:
+    image: bbhunt:latest
+    volumes:
+      - ./data:/app/data
+    environment:
+      - BBHUNT_MODE=worker
+      - BBHUNT_WORKER_TYPE=report
+      - BBHUNT_REDIS_HOST=redis
+      - MAX_MEMORY=1G
+      - MAX_CPU=1
+    depends_on:
+      - redis
+      - bbhunt-core
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+    restart: unless-stopped
+    networks:
+      - bbhunt-net
+
+volumes:
+  redis-data:
+
+networks:
+  bbhunt-net:
+    driver: bridge
