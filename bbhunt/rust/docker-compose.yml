@@ -1,0 +1,48 @@
+version: '3.8'
+
+services:
+  bbhunt-core:
+    build: .
+    volumes:
+      - ./data:/data
+      - ./config:/config
+    environment:
+      - BBHUNT_DATA_DIR=/data
+      - BBHUNT_CONFIG_DIR=/config
+    networks:
+      - bbhunt-network
+
+  redis:
+    image: redis:alpine
+    networks:
+      - bbhunt-network
+    volumes:
+      - redis-data:/data
+
+  # Optional worker services
+  recon-worker:
+    build: .
+    command: run worker --type recon
+    depends_on:
+      - redis
+    networks:
+      - bbhunt-network
+    deploy:
+      replicas: 2
+
+  scan-worker:
+    build: .
+    command: run worker --type scan
+    depends_on:
+      - redis
+    networks:
+      - bbhunt-network
+    deploy:
+      replicas: 2
+
+networks:
+  bbhunt-network:
+    driver: bridge
+
+volumes:
+  redis-data:
